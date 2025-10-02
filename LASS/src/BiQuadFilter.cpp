@@ -46,7 +46,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "MultiTrack.h"
 #include "Filter.h"
 #include "BiQuadFilter.h"
-
+#ifdef HAVE_CUDA
+  #include "../CUDA/FilterGPU.h"
+#endif
 
 //----------------------------------------------------------------------------//
 
@@ -186,8 +188,8 @@ m_sample_type BiQuadFilter::do_filter(m_sample_type sample)
     /* shift y1 to y2, result to y1 */
     by2 = by1;
     by1 = result;
-    y_hist->enqueue(result);
-    y_hist->enqueue(by1);     	
+    y_hist->enqueue(by1);
+    y_hist->enqueue(by2);     	
 
 
     return result;
@@ -204,17 +206,7 @@ SoundSample *BiQuadFilter::do_filter_SoundSample(SoundSample *inWave)
   
   
 	int i;
-	SoundSample *outWave;
-
-	// create new SoundSample
-	outWave = new SoundSample(inWave->getSampleCount(),
-							  inWave->getSamplingRate());
-
-	for(i=0;i<inWave->getSampleCount();i++)
-	{
-		(*outWave)[i] = do_filter((*inWave)[i]);
-//	outWave->operator[](i) = do_filter(inWave->operator[](i));
-	}
+	SoundSample *outWave = do_biquad_filter_GPU(inWave, ba0, ba1, ba2, ba3, ba4);
 
 	return outWave;
 }
@@ -222,10 +214,12 @@ SoundSample *BiQuadFilter::do_filter_SoundSample(SoundSample *inWave)
 //----------------------------------------------------------------------------//
 void BiQuadFilter::reset()
 {
-	// reinitialize y_hist queue
 	delete y_hist;
-	y_hist = new Filter::hist_queue<m_sample_type>(1);
-	y_hist->enqueue(0.0);
+    delete x_hist;
+    y_hist = new Filter::hist_queue<m_sample_type>(2);
+    x_hist = new Filter::hist_queue<m_sample_type>(2);
+    y_hist->enqueue(0.0); y_hist->enqueue(0.0);
+    x_hist->enqueue(0.0); x_hist->enqueue(0.0);
 }
 
 //----------------------------------------------------------------------------//

@@ -17,7 +17,7 @@
 
 //----------------------------------------------------------------------------//
 #include "StandardHeaders.h"
-
+#include "BiQuadFilter.h"
 #include "SoundSample.h"
 #include "Collection.h"
 #include "Track.h"
@@ -283,6 +283,7 @@ class Reverb
   float allPassDelay;
   LPCombFilter *lpcfilter[REVERB_NUM_COMB_FILTERS];
   AllPassFilter *apfilter;
+  BiQuadFilter  * bq;
   float decay_duration;
   int x_at;
   Envelope *percentReverb;

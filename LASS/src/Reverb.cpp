@@ -235,7 +235,14 @@ void Reverb::ConstructorCommon(Envelope *percentReverbinput, float *comb_gain_li
   // Make an all pass filter
   allPassDelay = delay;
   apfilter = new AllPassFilter(gainAllPass, (long)((m_time_type)allPassDelay*samplingRate) );
-
+  bq = new BiQuadFilter(
+    BiQuadFilter::LPF,   // type
+    0.0f,              // dB gain (ignored for LPF/HPF/NOTCH; kept for completeness)
+    2000.0f,           // center/cutoff frequency in Hz
+    44100.0f,          // sample rate in Hz
+    1.0f               // bandwidth in octaves (used in alpha computation)
+);
+x_at = 0;
   // Find the decay time
   float alpha = 0.0; // alpha is the steady state gain (which is also the max of the gain fn
 #define max(x,y) ((x) > (y) ? (x) : (y))
@@ -255,7 +262,7 @@ Reverb::~Reverb()
 
   for(i=0;i<REVERB_NUM_COMB_FILTERS;i++)
     delete lpcfilter[i];
-
+  delete bq;
   delete apfilter;
   delete percentReverb;
 }
@@ -277,34 +284,22 @@ m_sample_type Reverb::do_reverb(m_sample_type x_t, float x_value, Envelope *perc
   // run the sample through various comb filters (for effeciency
   // reasons, I hard coded this (instead of looping from 0 to
   // (REVERB_NUM_COMB_FILTERS-1).
-  y  = lpcfilter[0]->do_filter(x_t);
-  y += lpcfilter[1]->do_filter(x_t);
-  y += lpcfilter[2]->do_filter(x_t);
-  y += lpcfilter[3]->do_filter(x_t);
-  y += lpcfilter[4]->do_filter(x_t);
-  y += lpcfilter[5]->do_filter(x_t);
-  y /= (m_sample_type)REVERB_NUM_COMB_FILTERS;
-
-
-  // after adding up the results, run it through an allpass filter
-  y = apfilter->do_filter(y);
+  y  = bq->do_filter(x_t);
   // Mix it with the input sound
-  float durationofEnv = percentReverb->getDuration();
-  float EnvelopeValueAtx = percentReverb->getValue(x_value,durationofEnv);
-  y = (EnvelopeValueAtx*y) + ((1 - EnvelopeValueAtx)*x_t);
+
   
-  // if(x_at == 0)
-  //   cout<<"y0 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
+   if(x_at == 0)
+     cout<<"y0 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
   
-  // if(x_at == 1000)
-  //   cout<<"y1000 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
+   if(x_at == 2)
+     cout<<"y1000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
   
-  // if(x_at == 10000)
-  //   cout<<"y10000 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
+   if(x_at == 10000)
+     cout<<"y10000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
   
-  // if(x_at == 100000)
-  //   cout<<"y100000 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
-  // x_at++;
+   if(x_at == 100000)
+     cout<<"y100000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
+   x_at++;
 
   return y;
 }
@@ -325,6 +320,7 @@ void Reverb::reset(void)
   for(i=0;i<REVERB_NUM_COMB_FILTERS;i++)
     lpcfilter[i]->reset();
   apfilter->reset();
+  bq->reset();
 }
 
 /**
@@ -413,7 +409,13 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percen
   percentReverb = temp;
 
   #ifdef HAVE_CUDA
-  outWave=do_reverb_SoundSample_GPU(inWave, percentReverb, lpcfilter, apfilter);
+  outWave=bq->do_filter_SoundSample(inWave);
+  outWave = new SoundSample(inWave->getSampleCount(),
+	  		    inWave->getSamplingRate());
+
+    for(i=0;i<inWave->getSampleCount();i++)
+      (*outWave)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
+			      , percentReverb);
   #else
     // create new SoundSample
     outWave = new SoundSample(inWave->getSampleCount(),
