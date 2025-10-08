@@ -412,11 +412,11 @@ SoundSample* do_biquad_filter_GPU(SoundSample *inWave, float ba0, float ba1, flo
     thrust::copy(outWave_dv.begin(),outWave_dv.end(),outWave->getData());
      
     cout<<"outwave 0 "<<(*outWave)[0]<<endl;
-    cout<<"outwave 1000 "<<(*outWave)[2]<<endl;
+    cout<<"outwave 1000 "<<(*outWave)[1000]<<endl;
     cout<<"outwave 10000 "<<(*outWave)[10000]<<endl;
     cout<<"outwave 100000 "<<(*outWave)[100000]<<endl;
     //cout<< AR2Scan::getb0(outWave_cumulative_matrix[1]) << endl;
-    cout<< (inWaveData[2] * ba0 ) + (inWaveData[1] * ba1 )+ (inWaveData[0] * ba2) - (ba3 * AR2Scan::getb0(outWave_cumulative_matrix[1])) - (ba4 * AR2Scan::getb0(outWave_cumulative_matrix[0])) << endl;
+    //cout<< (inWaveData[2] * ba0 ) + (inWaveData[1] * ba1 )+ (inWaveData[0] * ba2) - (ba3 * AR2Scan::getb0(outWave_cumulative_matrix[1])) - (ba4 * AR2Scan::getb0(outWave_cumulative_matrix[0])) << endl;
     //cout << inWaveData[0] * biQuadFilter->get_ba0() << endl;
     cudaFree(inWaveDataD);
     cudaFree(outWaveDataD);

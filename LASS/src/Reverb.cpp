@@ -291,7 +291,7 @@ m_sample_type Reverb::do_reverb(m_sample_type x_t, float x_value, Envelope *perc
    if(x_at == 0)
      cout<<"y0 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
   
-   if(x_at == 2)
+   if(x_at == 1000)
      cout<<"y1000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
   
    if(x_at == 10000)
@@ -416,6 +416,21 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percen
     for(i=0;i<inWave->getSampleCount();i++)
       (*outWave)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
 			      , percentReverb);
+    std::vector<float> y(inWave->getSampleCount(), 0.0);
+
+    for (size_t n = 0; n < inWave->getSampleCount(); ++n) {
+        float x0 = (*inWave)[n];
+        float x1 = (n >= 1) ? (*inWave)[n - 1] : 0.0;
+        float x2 = (n >= 2) ? (*inWave)[n - 2] : 0.0;
+        float y1 = (n >= 1) ? y[n - 1] : 0.0;
+        float y2 = (n >= 2) ? y[n - 2] : 0.0;
+
+        y[n] = bq->ba0 * x0 + bq->ba1 * x1 + bq->ba2 * x2 - bq->ba1 * y1 - bq->ba2 * y2;
+    }
+    cout << y[0] << endl;
+    cout << y[1000] << endl;
+    cout << y[10000] << endl;
+    cout << y[100000] << endl;
   #else
     // create new SoundSample
     outWave = new SoundSample(inWave->getSampleCount(),
