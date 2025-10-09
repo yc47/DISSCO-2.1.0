@@ -6,6 +6,7 @@
 #include <thrust/transform.h>
 #include <thrust/scan.h>
 #include <thrust/copy.h>
+#include <chrono>
 #define CUDA_CHECK(call)                                                     \
 do {                                                                         \
     cudaError_t err = call;                                                  \
@@ -392,11 +393,13 @@ SoundSample* do_reverb_SoundSample_GPU(SoundSample *inWave, Envelope *percentRev
     return outWave;
 }
 SoundSample* do_biquad_filter_GPU(SoundSample *inWave, float ba0, float ba1, float ba2, float ba3, float ba4){
+ 
     SoundSample *outWave=new SoundSample(inWave->getSampleCount(),inWave->getSamplingRate());
-    float *inWaveData=inWave->getData(), *outWaveDataD, *inWaveDataD, *outWaveData=new float[inWave->getSampleCount()];
+    float *inWaveData=inWave->getData(), *outWaveDataD, *inWaveDataD  ;
     long sampleSize=inWave->getSampleCount();
 
     cudaMalloc(&inWaveDataD, sampleSize*sizeof(float));
+ 
     cudaMalloc(&outWaveDataD, sampleSize*sizeof(float));
     cudaMemcpy(inWaveDataD, inWaveData, sampleSize*sizeof(float), cudaMemcpyHostToDevice);
     BiQuadFilterGPU<<<1, 1024>>>(inWaveDataD, outWaveDataD, ba0, ba1, ba2, ba0, ba1, ba2, sampleSize);
@@ -407,7 +410,9 @@ SoundSample* do_biquad_filter_GPU(SoundSample *inWave, float ba0, float ba1, flo
   
     thrust::device_vector<AR2Scan::Node> outWave_cumulative_matrix(sampleSize);
     thrust::transform(outWave_dv.begin(),outWave_dv.end(),outWave_cumulative_matrix.begin(),AR2Scan::make_node_from_y{-1*ba3, -1*ba4});
+    
     thrust::inclusive_scan(outWave_cumulative_matrix.begin(),outWave_cumulative_matrix.end(),outWave_cumulative_matrix.begin(),AR2Scan::compose_nodes{});
+
     thrust::transform(outWave_cumulative_matrix.begin(),outWave_cumulative_matrix.end(),outWave_dv.begin(),AR2Scan::get_b0{});
     thrust::copy(outWave_dv.begin(),outWave_dv.end(),outWave->getData());
      
@@ -420,7 +425,7 @@ SoundSample* do_biquad_filter_GPU(SoundSample *inWave, float ba0, float ba1, flo
     //cout << inWaveData[0] * biQuadFilter->get_ba0() << endl;
     cudaFree(inWaveDataD);
     cudaFree(outWaveDataD);
-    delete[] outWaveData;
+     
     
     return outWave;
 }

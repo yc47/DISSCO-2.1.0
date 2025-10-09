@@ -19,7 +19,7 @@
 #define __MOSS_REVERB_CPP
 
 //----------------------------------------------------------------------------//
-
+#include <cstdlib>
 #include "SoundSample.h"
 #include "Collection.h"
 #include "Track.h"
@@ -401,7 +401,7 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave)
 }
 SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percentReverbinput)
 {
-
+  int hash = rand()%12567;
   int i;
   SoundSample *outWave;  
   Envelope* temp = new Envelope(*percentReverbinput);
@@ -409,13 +409,26 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percen
   percentReverb = temp;
 
   #ifdef HAVE_CUDA
-  outWave=bq->do_filter_SoundSample(inWave);
-  outWave = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());
+// Measure GPU time
+auto gpu_start = std::chrono::high_resolution_clock::now();
+outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
+outWave = bq->do_filter_SoundSample(inWave);  // GPU method
+cudaDeviceSynchronize();  // ⭐ CRITICAL: Wait for GPU to finish!
+auto gpu_end = std::chrono::high_resolution_clock::now();
+printf("%d gpu: %.3f ms\n", hash,
+    std::chrono::duration<double, std::milli>(gpu_end - gpu_start).count());
 
-    for(i=0;i<inWave->getSampleCount();i++)
-      (*outWave)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
-			      , percentReverb);
+// Measure CPU time separately
+auto cpu_start = std::chrono::high_resolution_clock::now();
+outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
+for(i=0; i<inWave->getSampleCount(); i++){
+    (*outWave)[i] = do_reverb((*inWave)[i], 
+                              (float)i / inWave->getSampleCount(), 
+                              percentReverb);
+}
+auto cpu_end = std::chrono::high_resolution_clock::now();
+printf("%d cpu: %.3f ms\n", hash,
+    std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());/*
     std::vector<float> y(inWave->getSampleCount(), 0.0);
 
     for (size_t n = 0; n < inWave->getSampleCount(); ++n) {
@@ -430,7 +443,7 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percen
     cout << y[0] << endl;
     cout << y[1000] << endl;
     cout << y[10000] << endl;
-    cout << y[100000] << endl;
+    cout << y[100000] << endl;*/
   #else
     // create new SoundSample
     outWave = new SoundSample(inWave->getSampleCount(),
