@@ -18,67 +18,38 @@ do {                                                                         \
 } while (0)
 
 #define CEIL_MULT(x, y)  ( (( (x) + (y) - 1 ) / (y) ) * (y) )
-class AR2Scan {
-public:
-    using value_type = float;
 
+
+__global__ void BiQuadFilterFused(
+    const float* __restrict__ inputSample,
+    AR2Scan::Node* __restrict__ outputNodes,
+    float ba0, float ba1, float ba2,
+    float alpha1, float alpha2,
+    long sampleSize)
+{
+    // Calculate global thread index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
     
-    struct __align__(32) Node {
-        value_type a00, a01, a10, a11; // A
-        value_type b0,  b1;            // b
-    };
-
-    struct compose_nodes {
-        __host__ __device__
-        Node operator()(const Node& left, const Node& right) const {
-            Node out;
-            // A = Ar * Al
-            out.a00 = right.a00*left.a00 + right.a01*left.a10;
-            out.a01 = right.a00*left.a01 + right.a01*left.a11;
-            out.a10 = right.a10*left.a00 + right.a11*left.a10;
-            out.a11 = right.a10*left.a01 + right.a11*left.a11;
-            // b = Ar*bl + br
-            out.b0  = right.a00*left.b0 + right.a01*left.b1 + right.b0;
-            out.b1  = right.a10*left.b0 + right.a11*left.b1 + right.b1;
-            return out;
-        }
-    };
-
-    struct make_node_from_y {
-        value_type a, b;
-        __host__ __device__
-        Node operator()(const value_type yi) const {
-            Node n;
-            n.a00 = a;   n.a01 = b;
-            n.a10 = 1;   n.a11 = 0;
-            n.b0  = yi;  n.b1  = 0;
-            return n;
-        }
-    };
-
-    struct get_b0 {
-        __host__ __device__
-        value_type operator()(const Node& n) const { return n.b0; }
-    };
-    static value_type getb0(Node node){
-        return node.b0;
-    }
-    
-};
-
-__global__ void BiQuadFilterGPU(float *inputSample, float* outputSample, float a0, float a1, float a2, float b0, float b1, float b2, long sampleSize){
-    if(threadIdx.x == 0){
-        outputSample[0] = (b0) * inputSample[0];
-        outputSample[1] = (b1) * inputSample[0] + (b0) * inputSample[1];
-
-    }
-    
-    for(int i = 0; i < (sampleSize + blockDim.x - 1)/ blockDim.x; i++){
+    // Process elements with grid-stride loop
+    for (int i = idx; i < sampleSize; i += stride) {
+        // Compute feedforward: f[n] = ba0*x[n] + ba1*x[n-1] + ba2*x[n-2]
+        float x_n  = inputSample[i];
+        float x_n1 = (i >= 1) ? inputSample[i-1] : 0.0f;
+        float x_n2 = (i >= 2) ? inputSample[i-2] : 0.0f;
         
-        if(i * blockDim.x + threadIdx.x < sampleSize && i * blockDim.x + threadIdx.x > 1){
-            outputSample[i * blockDim.x + threadIdx.x] = (b0) * inputSample[i * blockDim.x + threadIdx.x] + (b1) * inputSample[i * blockDim.x + threadIdx.x - 1]+ (b2) * inputSample[i * blockDim.x + threadIdx.x - 2];
-        }
+        float f_n = ba0*x_n + ba1*x_n1 + ba2*x_n2;
         
+        // Create node directly with feedback coefficients
+        AR2Scan::Node node;
+        node.a00 = alpha1;
+        node.a01 = alpha2;
+        node.a10 = 1.0f;
+        node.a11 = 0.0f;
+        node.b0  = f_n;
+        node.b1  = 0.0f;
+        
+        outputNodes[i] = node;
     }
 }
 __global__ void LPCombFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float inputLpf_gain, float *delaybuf0, float *delaybuf1, long sampleSize){
@@ -392,40 +363,86 @@ SoundSample* do_reverb_SoundSample_GPU(SoundSample *inWave, Envelope *percentRev
 
     return outWave;
 }
-SoundSample* do_biquad_filter_GPU(SoundSample *inWave, float ba0, float ba1, float ba2, float ba3, float ba4){
- 
-    SoundSample *outWave=new SoundSample(inWave->getSampleCount(),inWave->getSamplingRate());
-    float *inWaveData=inWave->getData(), *outWaveDataD, *inWaveDataD  ;
-    long sampleSize=inWave->getSampleCount();
-
-    cudaMalloc(&inWaveDataD, sampleSize*sizeof(float));
- 
-    cudaMalloc(&outWaveDataD, sampleSize*sizeof(float));
-    cudaMemcpy(inWaveDataD, inWaveData, sampleSize*sizeof(float), cudaMemcpyHostToDevice);
-    BiQuadFilterGPU<<<1, 1024>>>(inWaveDataD, outWaveDataD, ba0, ba1, ba2, ba0, ba1, ba2, sampleSize);
+SoundSample* do_biquad_filter_GPU(
+    SoundSample *inWave, 
+    float ba0, float ba1, float ba2, 
+    float ba3, float ba4)
+{
+    SoundSample *outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
+    float *inWaveDataD;
+    AR2Scan::Node *nodesD;
+    long sampleSize = inWave->getSampleCount();
+    
+    // Allocate device memory
+    cudaMalloc(&inWaveDataD, sampleSize * sizeof(float));
+    cudaMalloc(&nodesD, sampleSize * sizeof(AR2Scan::Node));
+    
+    // Copy input to device
+    cudaMemcpy(inWaveDataD, inWave->getData(), sampleSize * sizeof(float), cudaMemcpyHostToDevice);
+    
+    auto gpu_start = std::chrono::high_resolution_clock::now();
+    
+    // SINGLE FUSED KERNEL: Replaces BiQuadFilterGPU + thrust::transform
+    int threadsPerBlock = 256;
+    int numBlocks = (sampleSize + threadsPerBlock - 1) / threadsPerBlock;
+    
+    BiQuadFilterFused<<<numBlocks, threadsPerBlock>>>(
+        inWaveDataD, 
+        nodesD,
+        ba0, ba1, ba2,
+        -ba3, -ba4,  // Negated feedback coefficients
+        sampleSize
+    );
+    
+    printf("Fused kernel: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - gpu_start).count());
     
     cudaDeviceSynchronize();
-    thrust::device_ptr<float> temp(outWaveDataD);
-    thrust::device_vector<float> outWave_dv(temp, temp+sampleSize);
-  
-    thrust::device_vector<AR2Scan::Node> outWave_cumulative_matrix(sampleSize);
-    thrust::transform(outWave_dv.begin(),outWave_dv.end(),outWave_cumulative_matrix.begin(),AR2Scan::make_node_from_y{-1*ba3, -1*ba4});
     
-    thrust::inclusive_scan(outWave_cumulative_matrix.begin(),outWave_cumulative_matrix.end(),outWave_cumulative_matrix.begin(),AR2Scan::compose_nodes{});
-
-    thrust::transform(outWave_cumulative_matrix.begin(),outWave_cumulative_matrix.end(),outWave_dv.begin(),AR2Scan::get_b0{});
-    thrust::copy(outWave_dv.begin(),outWave_dv.end(),outWave->getData());
-     
+    // Wrap in thrust device_vector for scan
+    thrust::device_ptr<AR2Scan::Node> nodes_ptr(nodesD);
+    
+    // Scan to solve recurrence
+    auto scan_start = std::chrono::high_resolution_clock::now();
+    thrust::inclusive_scan(
+        nodes_ptr,
+        nodes_ptr + sampleSize,
+        nodes_ptr,
+        AR2Scan::compose_nodes{}
+    );
+    printf("Scan: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - scan_start).count());
+    
+    cudaDeviceSynchronize();
+    
+    // Extract output
+    auto extract_start = std::chrono::high_resolution_clock::now();
+    thrust::device_vector<float> outWave_dv(sampleSize);
+    thrust::transform(
+        nodes_ptr,
+        nodes_ptr + sampleSize,
+        outWave_dv.begin(),
+        AR2Scan::get_b0{}
+    );
+    printf("Extract: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - extract_start).count());
+    
+    // Copy result back to host
+    thrust::copy(outWave_dv.begin(), outWave_dv.end(), outWave->getData());
+    
+    printf("Total: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - gpu_start).count());
+    
+    // Cleanup
+    cudaFree(inWaveDataD);
+    cudaFree(nodesD);
     cout<<"outwave 0 "<<(*outWave)[0]<<endl;
     cout<<"outwave 1000 "<<(*outWave)[1000]<<endl;
     cout<<"outwave 10000 "<<(*outWave)[10000]<<endl;
     cout<<"outwave 100000 "<<(*outWave)[100000]<<endl;
-    //cout<< AR2Scan::getb0(outWave_cumulative_matrix[1]) << endl;
-    //cout<< (inWaveData[2] * ba0 ) + (inWaveData[1] * ba1 )+ (inWaveData[0] * ba2) - (ba3 * AR2Scan::getb0(outWave_cumulative_matrix[1])) - (ba4 * AR2Scan::getb0(outWave_cumulative_matrix[0])) << endl;
-    //cout << inWaveData[0] * biQuadFilter->get_ba0() << endl;
-    cudaFree(inWaveDataD);
-    cudaFree(outWaveDataD);
-     
-    
     return outWave;
 }
