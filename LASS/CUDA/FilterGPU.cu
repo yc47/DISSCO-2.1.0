@@ -1,57 +1,237 @@
 
-
 #include "FilterGPU.h"
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/transform.h>
-#include <thrust/scan.h>
-#include <thrust/copy.h>
+#include <cuda_runtime.h>
 #include <chrono>
-#define CUDA_CHECK(call)                                                     \
-do {                                                                         \
-    cudaError_t err = call;                                                  \
-    if (err != cudaSuccess) {                                                \
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,     \
-                cudaGetErrorString(err));                                    \
-        exit(EXIT_FAILURE);                                                  \
-    }                                                                        \
+#include <stdio.h>
+
+#define CUDA_CHECK(call) \
+do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
 } while (0)
-
 #define CEIL_MULT(x, y)  ( (( (x) + (y) - 1 ) / (y) ) * (y) )
+// Optimized node structure with 16-byte alignment
+ 
 
+// Device function for composing two AR2 nodes
+__device__ __forceinline__
+AR2Node compose_nodes(const AR2Node& left, const AR2Node& right) {
+    AR2Node out;
+    // Matrix multiplication: out.A = right.A * left.A
+    out.a00 = right.a00 * left.a00 + right.a01 * left.a10;
+    out.a01 = right.a00 * left.a01 + right.a01 * left.a11;
+    out.a10 = right.a10 * left.a00 + right.a11 * left.a10;
+    out.a11 = right.a10 * left.a01 + right.a11 * left.a11;
+    // Vector: out.b = right.A * left.b + right.b
+    out.b0 = right.a00 * left.b0 + right.a01 * left.b1 + right.b0;
+    out.b1 = right.a10 * left.b0 + right.a11 * left.b1 + right.b1;
+    return out;
+}
 
+// KERNEL 1: Fused feedforward computation and node creation
 __global__ void BiQuadFilterFused(
     const float* __restrict__ inputSample,
-    AR2Scan::Node* __restrict__ outputNodes,
+    AR2Node* __restrict__ outputNodes,
     float ba0, float ba1, float ba2,
     float alpha1, float alpha2,
     long sampleSize)
 {
-    // Calculate global thread index
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
     
-    // Process elements with grid-stride loop
-    for (int i = idx; i < sampleSize; i += stride) {
+    if (idx < sampleSize) {
         // Compute feedforward: f[n] = ba0*x[n] + ba1*x[n-1] + ba2*x[n-2]
-        float x_n  = inputSample[i];
-        float x_n1 = (i >= 1) ? inputSample[i-1] : 0.0f;
-        float x_n2 = (i >= 2) ? inputSample[i-2] : 0.0f;
+        float x_n  = inputSample[idx];
+        float x_n1 = (idx >= 1) ? inputSample[idx - 1] : 0.0f;
+        float x_n2 = (idx >= 2) ? inputSample[idx - 2] : 0.0f;
         
-        float f_n = ba0*x_n + ba1*x_n1 + ba2*x_n2;
+        float f_n = ba0 * x_n + ba1 * x_n1 + ba2 * x_n2;
         
-        // Create node directly with feedback coefficients
-        AR2Scan::Node node;
-        node.a00 = alpha1;
-        node.a01 = alpha2;
-        node.a10 = 1.0f;
-        node.a11 = 0.0f;
-        node.b0  = f_n;
-        node.b1  = 0.0f;
+        // Create node
+        AR2Node node;
+        node.a00 = alpha1; node.a01 = alpha2;
+        node.a10 = 1.0f;   node.a11 = 0.0f;
+        node.b0 = f_n;     node.b1 = 0.0f;
         
-        outputNodes[i] = node;
+        outputNodes[idx] = node;
     }
 }
+
+// KERNEL 2: Simple Kogge-Stone inclusive scan within blocks
+__global__ void block_scan_kogge_stone(
+    AR2Node* __restrict__ data,
+    AR2Node* __restrict__ block_results,
+    long N)
+{
+    __shared__ AR2Node temp[256];
+    
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    
+    // Load into shared memory
+    if (idx < N) {
+        temp[tid] = data[idx];
+    } else {
+        // Out of bounds - shouldn't affect results
+        temp[tid].a00 = 1.0f; temp[tid].a01 = 0.0f;
+        temp[tid].a10 = 0.0f; temp[tid].a11 = 1.0f;
+        temp[tid].b0 = 0.0f;  temp[tid].b1 = 0.0f;
+    }
+    __syncthreads();
+    
+    // Kogge-Stone inclusive scan
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        AR2Node val;
+        if (tid >= stride) {
+            val = compose_nodes(temp[tid - stride], temp[tid]);
+        } else {
+            val = temp[tid];
+        }
+        __syncthreads();
+        temp[tid] = val;
+        __syncthreads();
+    }
+    
+    // Write back to global memory
+    if (idx < N) {
+        data[idx] = temp[tid];
+    }
+    
+    // Save last element of each block for inter-block scan
+    if (tid == blockDim.x - 1 && block_results != nullptr) {
+        block_results[blockIdx.x] = temp[tid];
+    }
+}
+
+// KERNEL 3: Add block prefix to all elements in subsequent blocks
+__global__ void add_block_prefix(
+    AR2Node* __restrict__ data,
+    const AR2Node* __restrict__ block_prefixes,
+    long N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < N && blockIdx.x > 0) {
+        data[idx] = compose_nodes(block_prefixes[blockIdx.x - 1], data[idx]);
+    }
+}
+
+// KERNEL 4: Extract output (b0 component) from nodes
+__global__ void extract_b0(
+    const AR2Node* __restrict__ nodes,
+    float* __restrict__ output,
+    long N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < N) {
+        output[idx] = nodes[idx].b0;
+    }
+}
+
+// Host function: Complete biquad filter with custom kernels only
+SoundSample* do_biquad_filter_GPU(
+    SoundSample *inWave, 
+    float ba0, float ba1, float ba2, 
+    float ba3, float ba4)
+{
+    long sampleSize = inWave->getSampleCount();
+    SoundSample *outWave = new SoundSample(sampleSize, inWave->getSamplingRate());
+    
+    // Device memory pointers
+    float *d_input, *d_output;
+    AR2Node *d_nodes, *d_block_results;
+    
+    // Allocate device memory
+    CUDA_CHECK(cudaMalloc(&d_input, sampleSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, sampleSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_nodes, sampleSize * sizeof(AR2Node)));
+    
+    // Calculate grid dimensions
+    const int threadsPerBlock = 256;
+    const int numBlocks = (sampleSize + threadsPerBlock - 1) / threadsPerBlock;
+    CUDA_CHECK(cudaMalloc(&d_block_results, numBlocks * sizeof(AR2Node)));
+    
+    // Copy input to device
+    CUDA_CHECK(cudaMemcpy(d_input, inWave->getData(), 
+                          sampleSize * sizeof(float), cudaMemcpyHostToDevice));
+    
+    auto gpu_start = std::chrono::high_resolution_clock::now();
+    
+    // STEP 1: Fused feedforward + node creation
+    BiQuadFilterFused<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_nodes, ba0, ba1, ba2, -ba3, -ba4, sampleSize
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    printf("Fused kernel: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - gpu_start).count());
+    
+    // STEP 2: Two-level inclusive scan
+    auto scan_start = std::chrono::high_resolution_clock::now();
+    
+    // Level 1: Scan within each block
+    block_scan_kogge_stone<<<numBlocks, threadsPerBlock>>>(
+        d_nodes, d_block_results, sampleSize
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Level 2: If multiple blocks, scan the block results and propagate
+    if (numBlocks > 1) {
+        // Scan the block results
+        int blocks2 = (numBlocks + threadsPerBlock - 1) / threadsPerBlock;
+        block_scan_kogge_stone<<<blocks2, threadsPerBlock>>>(
+            d_block_results, nullptr, numBlocks
+        );
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Add block prefixes to all elements
+        add_block_prefix<<<numBlocks, threadsPerBlock>>>(
+            d_nodes, d_block_results, sampleSize
+        );
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    
+    printf("Scan: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - scan_start).count());
+    
+    // STEP 3: Extract output
+    auto extract_start = std::chrono::high_resolution_clock::now();
+    extract_b0<<<numBlocks, threadsPerBlock>>>(d_nodes, d_output, sampleSize);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    printf("Extract: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - extract_start).count());
+    
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(outWave->getData(), d_output,
+                          sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    printf("Total: %.3f ms\n", 
+           std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - gpu_start).count());
+    
+    // Print sample outputs for verification
+    cout << "outwave 0 " << (*outWave)[0] << endl;
+    cout << "outwave 1000 " << (*outWave)[1000] << endl;
+    cout << "outwave 10000 " << (*outWave)[10000] << endl;
+    cout << "outwave 100000 " << (*outWave)[100000] << endl;
+    
+    // Cleanup
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_nodes));
+    CUDA_CHECK(cudaFree(d_block_results));
+    
+    return outWave;
+}
+
 __global__ void LPCombFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float inputLpf_gain, float *delaybuf0, float *delaybuf1, long sampleSize){
     float gain=inputGain, lpf_gain=inputLpf_gain;
     double gaine;
@@ -361,88 +541,5 @@ SoundSample* do_reverb_SoundSample_GPU(SoundSample *inWave, Envelope *percentRev
     delete[] envXY;
     delete[] envSegType;
 
-    return outWave;
-}
-SoundSample* do_biquad_filter_GPU(
-    SoundSample *inWave, 
-    float ba0, float ba1, float ba2, 
-    float ba3, float ba4)
-{
-    SoundSample *outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-    float *inWaveDataD;
-    AR2Scan::Node *nodesD;
-    long sampleSize = inWave->getSampleCount();
-    
-    // Allocate device memory
-    cudaMalloc(&inWaveDataD, sampleSize * sizeof(float));
-    cudaMalloc(&nodesD, sampleSize * sizeof(AR2Scan::Node));
-    
-    // Copy input to device
-    cudaMemcpy(inWaveDataD, inWave->getData(), sampleSize * sizeof(float), cudaMemcpyHostToDevice);
-    
-    auto gpu_start = std::chrono::high_resolution_clock::now();
-    
-    // SINGLE FUSED KERNEL: Replaces BiQuadFilterGPU + thrust::transform
-    int threadsPerBlock = 256;
-    int numBlocks = (sampleSize + threadsPerBlock - 1) / threadsPerBlock;
-    
-    BiQuadFilterFused<<<numBlocks, threadsPerBlock>>>(
-        inWaveDataD, 
-        nodesD,
-        ba0, ba1, ba2,
-        -ba3, -ba4,  // Negated feedback coefficients
-        sampleSize
-    );
-    
-    printf("Fused kernel: %.3f ms\n", 
-           std::chrono::duration<double, std::milli>(
-               std::chrono::high_resolution_clock::now() - gpu_start).count());
-    
-    cudaDeviceSynchronize();
-    
-    // Wrap in thrust device_vector for scan
-    thrust::device_ptr<AR2Scan::Node> nodes_ptr(nodesD);
-    
-    // Scan to solve recurrence
-    auto scan_start = std::chrono::high_resolution_clock::now();
-    thrust::inclusive_scan(
-        nodes_ptr,
-        nodes_ptr + sampleSize,
-        nodes_ptr,
-        AR2Scan::compose_nodes{}
-    );
-    printf("Scan: %.3f ms\n", 
-           std::chrono::duration<double, std::milli>(
-               std::chrono::high_resolution_clock::now() - scan_start).count());
-    
-    cudaDeviceSynchronize();
-    
-    // Extract output
-    auto extract_start = std::chrono::high_resolution_clock::now();
-    thrust::device_vector<float> outWave_dv(sampleSize);
-    thrust::transform(
-        nodes_ptr,
-        nodes_ptr + sampleSize,
-        outWave_dv.begin(),
-        AR2Scan::get_b0{}
-    );
-    printf("Extract: %.3f ms\n", 
-           std::chrono::duration<double, std::milli>(
-               std::chrono::high_resolution_clock::now() - extract_start).count());
-    
-    // Copy result back to host
-    thrust::copy(outWave_dv.begin(), outWave_dv.end(), outWave->getData());
-    
-    printf("Total: %.3f ms\n", 
-           std::chrono::duration<double, std::milli>(
-               std::chrono::high_resolution_clock::now() - gpu_start).count());
-    
-    // Cleanup
-    cudaFree(inWaveDataD);
-    cudaFree(nodesD);
-    cout<<"outwave 0 "<<(*outWave)[0]<<endl;
-    cout<<"outwave 1000 "<<(*outWave)[1000]<<endl;
-    cout<<"outwave 10000 "<<(*outWave)[10000]<<endl;
-    cout<<"outwave 100000 "<<(*outWave)[100000]<<endl;
     return outWave;
 }

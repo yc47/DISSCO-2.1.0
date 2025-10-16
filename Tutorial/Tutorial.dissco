@@ -5,17 +5,17 @@
     <FileFlag>THMLBsnv</FileFlag>
     <TopEvent>0</TopEvent>
     <PieceStartTime>0</PieceStartTime>
-    <Duration>300</Duration>
+    <Duration>30</Duration>
     <Synthesis>True</Synthesis>
     <Score>False</Score>
     <GrandStaff>False</GrandStaff>
     <NumberOfStaff>1</NumberOfStaff>
     <NumberOfChannels>2</NumberOfChannels>
-    <SampleRate>441000</SampleRate>
-    <SampleSize>1600</SampleSize>
+    <SampleRate>44100</SampleRate>
+    <SampleSize>16</SampleSize>
     <NumberOfThreads>1</NumberOfThreads>
     <OutputParticel>True</OutputParticel>
-    <Seed>7</Seed>
+    <Seed>1</Seed>
   </ProjectConfiguration>
   <NoteModifiers>
     <DefaultModifiers>1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1</DefaultModifiers>
