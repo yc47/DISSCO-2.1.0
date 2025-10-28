@@ -1,6 +1,8 @@
-#include <cuda_runtime.h>
-#include <vector>
+
 #include "FilterGPU.h"
+#include <cuda_runtime.h>
+#include <chrono>
+#include <stdio.h>
 
 #define CUDA_CHECK(call) \
 do { \
@@ -11,98 +13,60 @@ do { \
         exit(EXIT_FAILURE); \
     } \
 } while (0)
-
 #define CEIL_MULT(x, y)  ( (( (x) + (y) - 1 ) / (y) ) * (y) )
+// Optimized node structure with 16-byte alignment
+ 
 
-// Host and device version for compose_nodes
-__host__ __device__ __forceinline__
+// Device function for composing two AR2 nodes
+__device__ __forceinline__
 AR2Node compose_nodes(const AR2Node& left, const AR2Node& right) {
     AR2Node out;
+    // Matrix multiplication: out.A = right.A * left.A
     out.a00 = right.a00 * left.a00 + right.a01 * left.a10;
     out.a01 = right.a00 * left.a01 + right.a01 * left.a11;
     out.a10 = right.a10 * left.a00 + right.a11 * left.a10;
     out.a11 = right.a10 * left.a01 + right.a11 * left.a11;
+    // Vector: out.b = right.A * left.b + right.b
     out.b0 = right.a00 * left.b0 + right.a01 * left.b1 + right.b0;
     out.b1 = right.a10 * left.b0 + right.a11 * left.b1 + right.b1;
     return out;
 }
 
-// Kernel 1: Fused feedforward + node creation
-__global__ void BiQuadFilterFused(
+// KERNEL 1: Merged feedforward computation, node creation, and block scan
+__global__ void BiQuadFilterFused_Scan(
     const float* __restrict__ inputSample,
     AR2Node* __restrict__ outputNodes,
+    AR2Node* __restrict__ block_results,
     float ba0, float ba1, float ba2,
     float alpha1, float alpha2,
-    long offset,
-    long chunkSize,
-    long totalSize)
-{
-    __shared__ float shared_input[258];
-    
-    int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + tid;
-    long globalIdx = offset + idx;
-    
-    if (idx < chunkSize && globalIdx < totalSize) {
-        shared_input[tid + 2] = inputSample[globalIdx];
-    } else {
-        shared_input[tid + 2] = 0.0f;
-    }
-    
-    if (tid == 0) {
-        long boundary_idx_1 = offset + blockIdx.x * blockDim.x - 1;
-        long boundary_idx_2 = offset + blockIdx.x * blockDim.x - 2;
-        
-        shared_input[1] = (boundary_idx_1 >= 0) ? inputSample[boundary_idx_1] : 0.0f;
-        shared_input[0] = (boundary_idx_2 >= 0) ? inputSample[boundary_idx_2] : 0.0f;
-    }
-    
-    __syncthreads();
-    
-    if (idx < chunkSize && globalIdx < totalSize) {
-        float x_n  = shared_input[tid + 2];
-        float x_n1 = shared_input[tid + 1];
-        float x_n2 = shared_input[tid];
-        
-        float f_n = ba0 * x_n + ba1 * x_n1 + ba2 * x_n2;
-        
-        AR2Node node;
-        node.a00 = alpha1; 
-        node.a01 = alpha2;
-        node.a10 = 1.0f;   
-        node.a11 = 0.0f;
-        node.b0 = f_n;     
-        node.b1 = 0.0f;
-        
-        outputNodes[globalIdx] = node;
-    }
-}
-
-// Kernel 2: Block-level kogge-stone scan
-__global__ void block_scan_kogge_stone(
-    AR2Node* __restrict__ data,
-    AR2Node* __restrict__ block_results,
-    long offset,
-    long N)
+    long sampleSize)
 {
     __shared__ AR2Node temp[256];
     
     int tid = threadIdx.x;
-    long globalIdx = offset + blockIdx.x * blockDim.x + tid;
     int idx = blockIdx.x * blockDim.x + tid;
     
-    if (idx < N) {
-        temp[tid] = data[globalIdx];
+    // Compute feedforward and create node
+    if (idx < sampleSize) {
+        float x_n  = inputSample[idx];
+        float x_n1 = (idx >= 1) ? inputSample[idx - 1] : 0.0f;
+        float x_n2 = (idx >= 2) ? inputSample[idx - 2] : 0.0f;
+        
+        float f_n = ba0 * x_n + ba1 * x_n1 + ba2 * x_n2;
+        
+        // Create node and load into shared memory
+        temp[tid].a00 = alpha1; temp[tid].a01 = alpha2;
+        temp[tid].a10 = 1.0f;   temp[tid].a11 = 0.0f;
+        temp[tid].b0 = f_n;     temp[tid].b1 = 0.0f;
     } else {
-        temp[tid].a00 = 1.0f; 
-        temp[tid].a01 = 0.0f;
-        temp[tid].a10 = 0.0f; 
-        temp[tid].a11 = 1.0f;
-        temp[tid].b0 = 0.0f;  
-        temp[tid].b1 = 0.0f;
+        // Out of bounds - identity node
+        temp[tid].a00 = 1.0f; temp[tid].a01 = 0.0f;
+        temp[tid].a10 = 0.0f; temp[tid].a11 = 1.0f;
+        temp[tid].b0 = 0.0f;  temp[tid].b1 = 0.0f;
     }
     __syncthreads();
     
+    // Kogge-Stone inclusive scan within block
     for (int stride = 1; stride < blockDim.x; stride *= 2) {
         AR2Node val;
         if (tid >= stride) {
@@ -115,322 +79,152 @@ __global__ void block_scan_kogge_stone(
         __syncthreads();
     }
     
-    if (idx < N) {
-        data[globalIdx] = temp[tid];
+    // Write back to global memory
+    if (idx < sampleSize) {
+        outputNodes[idx] = temp[tid];
     }
     
+    // Save last element of each block for inter-block scan
     if (tid == blockDim.x - 1 && block_results != nullptr) {
         block_results[blockIdx.x] = temp[tid];
     }
 }
 
-// Kernel 3: Add partition prefix
-__global__ void add_partition_prefix(
+// KERNEL 2: Simple Kogge-Stone inclusive scan (for block results)
+__global__ void block_scan_kogge_stone(
     AR2Node* __restrict__ data,
-    const AR2Node* __restrict__ prefix,
-    long offset,
-    long chunkSize,
-    long totalSize)
+    AR2Node* __restrict__ block_results,
+    long N)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    long globalIdx = offset + idx;
+    __shared__ AR2Node temp[256];
     
-    if (idx < chunkSize && globalIdx < totalSize) {
-        data[globalIdx] = compose_nodes(*prefix, data[globalIdx]);
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    
+    // Load into shared memory
+    if (idx < N) {
+        temp[tid] = data[idx];
+    } else {
+        // Out of bounds - shouldn't affect results
+        temp[tid].a00 = 1.0f; temp[tid].a01 = 0.0f;
+        temp[tid].a10 = 0.0f; temp[tid].a11 = 1.0f;
+        temp[tid].b0 = 0.0f;  temp[tid].b1 = 0.0f;
+    }
+    
+    
+    // Kogge-Stone inclusive scan
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        __syncthreads();
+        AR2Node val;
+        if (tid >= stride) {
+            val = compose_nodes(temp[tid - stride], temp[tid]);
+        } else {
+            val = temp[tid];
+        }
+      
+        temp[tid] = val;
+        
+    }
+    
+    // Write back to global memory
+    if (idx < N) {
+        data[idx] = temp[tid];
+    }
+    
+    // Save last element of each block for inter-block scan
+    if (tid == blockDim.x - 1 && block_results != nullptr) {
+        block_results[blockIdx.x] = temp[tid];
     }
 }
 
-// Kernel 4: Add block prefix
-__global__ void add_block_prefix(
-    AR2Node* __restrict__ data,
+// KERNEL 3: Add block prefix and extract output (b0 component)
+__global__ void AddPrefixAndExtract(
+    AR2Node* __restrict__ nodes,
     const AR2Node* __restrict__ block_prefixes,
-    long offset,
+    float* __restrict__ output,
     long N)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    long globalIdx = offset + idx;
     
-    if (idx < N && blockIdx.x > 0) {
-        data[globalIdx] = compose_nodes(block_prefixes[blockIdx.x - 1], data[globalIdx]);
+    if (idx < N) {
+        // Add block prefix if not in first block
+        AR2Node node = nodes[idx];
+        if (blockIdx.x > 0) {
+            node = compose_nodes(block_prefixes[blockIdx.x - 1], node);
+        }
+        
+        // Extract b0 to output
+        output[idx] = node.b0;
     }
 }
 
-// Kernel 5: Extract b0
-__global__ void extract_b0(
-    const AR2Node* __restrict__ nodes,
-    float* __restrict__ output,
-    long offset,
-    long chunkSize,
-    long totalSize)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    long globalIdx = offset + idx;
-    
-    if (idx < chunkSize && globalIdx < totalSize) {
-        output[globalIdx] = nodes[globalIdx].b0;
-    }
-}
-
-// Multi-Stream Memory Pool
-class MultiStreamMemoryPool {
-private:
-    static const int NUM_STREAMS = 4;
-    
-    float* d_input;
-    float* d_output;
-    AR2Node* d_nodes;
-    std::vector<AR2Node*> d_block_results;
-    AR2Node* d_partition_aggregates;
-    
-    float* h_pinned_input;
-    float* h_pinned_output;
-    AR2Node* h_partition_aggregates;
-    
-    std::vector<cudaStream_t> streams;
-    long allocated_size;
-    
-public:
-    MultiStreamMemoryPool() {
-        d_input = nullptr;
-        d_output = nullptr;
-        d_nodes = nullptr;
-        d_partition_aggregates = nullptr;
-        h_pinned_input = nullptr;
-        h_pinned_output = nullptr;
-        h_partition_aggregates = nullptr;
-        allocated_size = 0;
-        
-        streams.resize(NUM_STREAMS);
-        for (int i = 0; i < NUM_STREAMS; i++) {
-            CUDA_CHECK(cudaStreamCreate(&streams[i]));
-        }
-        
-        d_block_results.resize(NUM_STREAMS, nullptr);
-    }
-    
-    ~MultiStreamMemoryPool() {
-        free_all();
-        for (auto stream : streams) {
-            cudaStreamDestroy(stream);
-        }
-    }
-    
-    void allocate(long sampleSize) {
-        if (allocated_size >= sampleSize) {
-            return;
-        }
-        
-        free_all();
-        
-        const int threadsPerBlock = 256;
-        const long chunkSize = CEIL_MULT(sampleSize / NUM_STREAMS, threadsPerBlock);
-        const long maxBlocksPerStream = (chunkSize + threadsPerBlock - 1) / threadsPerBlock;
-        
-        CUDA_CHECK(cudaMalloc(&d_input, sampleSize * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_output, sampleSize * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_nodes, sampleSize * sizeof(AR2Node)));
-        CUDA_CHECK(cudaMalloc(&d_partition_aggregates, NUM_STREAMS * sizeof(AR2Node)));
-        
-        for (int i = 0; i < NUM_STREAMS; i++) {
-            CUDA_CHECK(cudaMalloc(&d_block_results[i], maxBlocksPerStream * sizeof(AR2Node)));
-        }
-        
-        CUDA_CHECK(cudaMallocHost(&h_pinned_input, sampleSize * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(&h_pinned_output, sampleSize * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(&h_partition_aggregates, NUM_STREAMS * sizeof(AR2Node)));
-        
-        allocated_size = sampleSize;
-    }
-    
-    void free_all() {
-        if (d_input) { cudaFree(d_input); d_input = nullptr; }
-        if (d_output) { cudaFree(d_output); d_output = nullptr; }
-        if (d_nodes) { cudaFree(d_nodes); d_nodes = nullptr; }
-        if (d_partition_aggregates) { cudaFree(d_partition_aggregates); d_partition_aggregates = nullptr; }
-        
-        for (auto& ptr : d_block_results) {
-            if (ptr) { cudaFree(ptr); ptr = nullptr; }
-        }
-        
-        if (h_pinned_input) { cudaFreeHost(h_pinned_input); h_pinned_input = nullptr; }
-        if (h_pinned_output) { cudaFreeHost(h_pinned_output); h_pinned_output = nullptr; }
-        if (h_partition_aggregates) { cudaFreeHost(h_partition_aggregates); h_partition_aggregates = nullptr; }
-        
-        allocated_size = 0;
-    }
-    
-    cudaStream_t get_stream(int i) { return streams[i]; }
-    float* get_h_pinned_input() { return h_pinned_input; }
-    float* get_h_pinned_output() { return h_pinned_output; }
-    float* get_d_input() { return d_input; }
-    float* get_d_output() { return d_output; }
-    AR2Node* get_d_nodes() { return d_nodes; }
-    AR2Node* get_d_block_results(int i) { return d_block_results[i]; }
-    AR2Node* get_d_partition_aggregates() { return d_partition_aggregates; }
-    AR2Node* get_h_partition_aggregates() { return h_partition_aggregates; }
-};
-
+// Host function: Complete biquad filter with custom kernels only
 SoundSample* do_biquad_filter_GPU(
     SoundSample *inWave, 
     float ba0, float ba1, float ba2, 
-    float ba3, float ba4) 
+    float ba3, float ba4)
 {
     long sampleSize = inWave->getSampleCount();
-    float *inputData = inWave->getData();
-    
-    float alpha1 = -ba3;
-    float alpha2 = -ba4;
-    
-    const int NUM_STREAMS = 4;
-    const int threadsPerBlock = 256;
-    const long chunkSize = CEIL_MULT(sampleSize / NUM_STREAMS, threadsPerBlock);
-    
-    static MultiStreamMemoryPool pool;
-    pool.allocate(sampleSize);
-    
-    memcpy(pool.get_h_pinned_input(), inputData, sampleSize * sizeof(float));
-    
-    // Phase 1: Per-stream independent processing
-    for (int s = 0; s < NUM_STREAMS; s++) {
-        cudaStream_t stream = pool.get_stream(s);
-        long offset = s * chunkSize;
-        long currentChunkSize = std::min(chunkSize, sampleSize - offset);
-        
-        if (currentChunkSize <= 0) break;
-        
-        int numBlocks = (currentChunkSize + threadsPerBlock - 1) / threadsPerBlock;
-        
-        CUDA_CHECK(cudaMemcpyAsync(
-            pool.get_d_input() + offset,
-            pool.get_h_pinned_input() + offset,
-            currentChunkSize * sizeof(float),
-            cudaMemcpyHostToDevice,
-            stream
-        ));
-        
-        BiQuadFilterFused<<<numBlocks, threadsPerBlock, 0, stream>>>(
-            pool.get_d_input(),
-            pool.get_d_nodes(),
-            ba0, ba1, ba2, alpha1, alpha2,
-            offset, currentChunkSize, sampleSize
-        );
-        
-        block_scan_kogge_stone<<<numBlocks, threadsPerBlock, 0, stream>>>(
-            pool.get_d_nodes(),
-            pool.get_d_block_results(s),
-            offset, currentChunkSize
-        );
-        
-        if (numBlocks > 1) {
-            int blocks2 = (numBlocks + threadsPerBlock - 1) / threadsPerBlock;
-            
-            block_scan_kogge_stone<<<blocks2, threadsPerBlock, 0, stream>>>(
-                pool.get_d_block_results(s), nullptr, 0, numBlocks
-            );
-            
-            add_block_prefix<<<numBlocks, threadsPerBlock, 0, stream>>>(
-                pool.get_d_nodes(), pool.get_d_block_results(s),
-                offset, currentChunkSize
-            );
-        }
-        
-        if (s < NUM_STREAMS) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                pool.get_d_partition_aggregates() + s,
-                pool.get_d_nodes() + offset + currentChunkSize - 1,
-                sizeof(AR2Node),
-                cudaMemcpyDeviceToDevice,
-                stream
-            ));
-        }
-    }
-    
-    for (int s = 0; s < NUM_STREAMS; s++) {
-        CUDA_CHECK(cudaStreamSynchronize(pool.get_stream(s)));
-    }
-    
-    // Phase 2: Scan partition aggregates
-    CUDA_CHECK(cudaMemcpy(
-        pool.get_h_partition_aggregates(),
-        pool.get_d_partition_aggregates(),
-        NUM_STREAMS * sizeof(AR2Node),
-        cudaMemcpyDeviceToHost
-    ));
-    
-    for (int i = 1; i < NUM_STREAMS; i++) {
-        pool.get_h_partition_aggregates()[i] = compose_nodes(
-            pool.get_h_partition_aggregates()[i-1],
-            pool.get_h_partition_aggregates()[i]
-        );
-    }
-    
-    CUDA_CHECK(cudaMemcpy(
-        pool.get_d_partition_aggregates(),
-        pool.get_h_partition_aggregates(),
-        NUM_STREAMS * sizeof(AR2Node),
-        cudaMemcpyHostToDevice
-    ));
-    
-    // Phase 3: Add partition prefixes
-    for (int s = 1; s < NUM_STREAMS; s++) {
-        cudaStream_t stream = pool.get_stream(s);
-        long offset = s * chunkSize;
-        long currentChunkSize = std::min(chunkSize, sampleSize - offset);
-        
-        if (currentChunkSize <= 0) break;
-        
-        int numBlocks = (currentChunkSize + threadsPerBlock - 1) / threadsPerBlock;
-        
-        add_partition_prefix<<<numBlocks, threadsPerBlock, 0, stream>>>(
-            pool.get_d_nodes(),
-            pool.get_d_partition_aggregates() + (s - 1),
-            offset, currentChunkSize, sampleSize
-        );
-    }
-    
-    for (int s = 1; s < NUM_STREAMS; s++) {
-        CUDA_CHECK(cudaStreamSynchronize(pool.get_stream(s)));
-    }
-    
-    // Phase 4: Extract output
-    for (int s = 0; s < NUM_STREAMS; s++) {
-        cudaStream_t stream = pool.get_stream(s);
-        long offset = s * chunkSize;
-        long currentChunkSize = std::min(chunkSize, sampleSize - offset);
-        
-        if (currentChunkSize <= 0) break;
-        
-        int numBlocks = (currentChunkSize + threadsPerBlock - 1) / threadsPerBlock;
-        
-        extract_b0<<<numBlocks, threadsPerBlock, 0, stream>>>(
-            pool.get_d_nodes(), pool.get_d_output(),
-            offset, currentChunkSize, sampleSize
-        );
-        
-        CUDA_CHECK(cudaMemcpyAsync(
-            pool.get_h_pinned_output() + offset,
-            pool.get_d_output() + offset,
-            currentChunkSize * sizeof(float),
-            cudaMemcpyDeviceToHost,
-            stream
-        ));
-    }
-    
-    for (int s = 0; s < NUM_STREAMS; s++) {
-        CUDA_CHECK(cudaStreamSynchronize(pool.get_stream(s)));
-    }
-    
     SoundSample *outWave = new SoundSample(sampleSize, inWave->getSamplingRate());
-    memcpy(outWave->getData(), pool.get_h_pinned_output(), sampleSize * sizeof(float));
+    
+    // Calculate grid dimensions
+    const int threadsPerBlock = 256;
+    const int numBlocks = (sampleSize + threadsPerBlock - 1) / threadsPerBlock;
+    
+    // Device memory pointers
+    float *d_float_base, *d_input, *d_output;
+    AR2Node *d_node_base, *d_nodes, *d_block_results;
+    
+    // Allocate device memory - merge allocations by type
+    // Allocate all float arrays together: d_input + d_output
+    CUDA_CHECK(cudaMalloc(&d_float_base, 2 * sampleSize * sizeof(float)));
+    d_input = d_float_base;                    // First sampleSize floats
+    d_output = d_float_base + sampleSize;      // Next sampleSize floats
+    
+    // Allocate all AR2Node arrays together: d_nodes + d_block_results
+    CUDA_CHECK(cudaMalloc(&d_node_base, (sampleSize + numBlocks) * sizeof(AR2Node)));
+    d_nodes = d_node_base;                     // First sampleSize nodes
+    d_block_results = d_node_base + sampleSize; // Next numBlocks nodes
+    
+    // Copy input to device
+    CUDA_CHECK(cudaMemcpy(d_input, inWave->getData(), 
+                          sampleSize * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // STEP 1: Merged feedforward + node creation + block scan
+    BiQuadFilterFused_Scan<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_nodes, d_block_results, ba0, ba1, ba2, -ba3, -ba4, sampleSize
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // STEP 2: Scan the block results (always run, even if numBlocks <= 1)
+    int blocks2 = (numBlocks + threadsPerBlock - 1) / threadsPerBlock;
+    block_scan_kogge_stone<<<blocks2, threadsPerBlock>>>(
+        d_block_results, nullptr, numBlocks
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // STEP 3: Add prefix and extract output
+    AddPrefixAndExtract<<<numBlocks, threadsPerBlock>>>(
+        d_nodes, d_block_results, d_output, sampleSize
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(outWave->getData(), d_output,
+                          sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Print sample outputs for verification
     cout << "outwave 0 " << (*outWave)[0] << endl;
     cout << "outwave 1000 " << (*outWave)[1000] << endl;
     cout << "outwave 10000 " << (*outWave)[10000] << endl;
     cout << "outwave 100000 " << (*outWave)[100000] << endl;
+    
+    // Cleanup - only 2 frees instead of 4
+    CUDA_CHECK(cudaFree(d_float_base));
+    CUDA_CHECK(cudaFree(d_node_base));
+    
     return outWave;
 }
-
-
-
 __global__ void LPCombFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float inputLpf_gain, float *delaybuf0, float *delaybuf1, long sampleSize){
     float gain=inputGain, lpf_gain=inputLpf_gain;
     double gaine;

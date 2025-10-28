@@ -15,45 +15,23 @@ SoundSample* do_biquad_filter_GPU(
     SoundSample *inWave, 
     float ba0, float ba1, float ba2, 
     float ba3, float ba4);
-__host__ __device__ __forceinline__
+__device__ __forceinline__
 AR2Node compose_nodes(const AR2Node& left, const AR2Node& right);
-__global__ void BiQuadFilterFused(
+
+ 
+__global__ void AddPrefixAndExtract(
+    AR2Node* __restrict__ nodes,
+    const AR2Node* __restrict__ block_prefixes,
+    float* __restrict__ output,
+    long N);
+__global__ void BiQuadFilterFused_Scan(
     const float* __restrict__ inputSample,
     AR2Node* __restrict__ outputNodes,
+    AR2Node* __restrict__ block_results,
     float ba0, float ba1, float ba2,
     float alpha1, float alpha2,
-    long offset,
-    long chunkSize,
-    long totalSize);
-    __device__ __forceinline__ AR2Node warp_scan_node(AR2Node val);
+    long sampleSize);
     __global__ void block_scan_kogge_stone(
         AR2Node* __restrict__ data,
         AR2Node* __restrict__ block_results,
-        long offset,
         long N);
-        __global__ void add_partition_prefix(
-            AR2Node* __restrict__ data,
-            const AR2Node* __restrict__ prefix,
-            long offset,
-            long chunkSize,
-            long totalSize);
-            __global__ void add_block_prefix(
-                AR2Node* __restrict__ data,
-                const AR2Node* __restrict__ block_prefixes,
-                long offset,
-                long N);
-                __global__ void extract_b0(
-                    const AR2Node* __restrict__ nodes,
-                    float* __restrict__ output,
-                    long offset,
-                    long chunkSize,
-                    long totalSize);
-                        
-                        // ============================================================================
-                        // Host Functions
-                        // ============================================================================
-                                              
-SoundSample* do_biquad_filter_GPU(
-SoundSample *inWave, 
-float ba0, float ba1, float ba2, 
-float ba3, float ba4);
