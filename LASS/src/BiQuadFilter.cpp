@@ -205,10 +205,21 @@ SoundSample *BiQuadFilter::do_filter_SoundSample(SoundSample *inWave)
 {
   
   
-	int i;
-	SoundSample *outWave = do_biquad_filter_GPU(inWave, ba0, ba1, ba2, ba3, ba4);
+	SoundSample* outWave = nullptr;
 
-	return outWave;
+	#ifdef HAVE_CUDA
+		outWave = do_biquad_filter_GPU(inWave, ba0, ba1, ba2, ba3, ba4);
+	#else
+		// create new SoundSample
+		outWave = new SoundSample(inWave->getSampleCount(),
+								inWave->getSamplingRate());
+
+		for (int i = 0; i < inWave->getSampleCount(); ++i) {
+			(*outWave)[i] = do_filter((*inWave)[i]);
+		}
+	#endif
+
+    return outWave;
 }
 
 //----------------------------------------------------------------------------//

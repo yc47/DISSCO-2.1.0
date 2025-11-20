@@ -35,3 +35,6 @@ __global__ void BiQuadFilterFused_Scan(
         AR2Node* __restrict__ data,
         AR2Node* __restrict__ block_results,
         long N);
+SoundSample* do_lp_filter_GPU(SoundSample *inWave, float lpf_g, float g, long d);
+__global__ void AllPassFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float *delaybuf0, float *delaybuf1, long sampleSize);
+SoundSample* do_ap_filter_GPU(SoundSample *inWave, float g, long d);

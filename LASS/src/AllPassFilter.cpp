@@ -37,7 +37,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "LPCombFilter.h"
 #include "LowPassFilter.h"
 #include "AllPassFilter.h"
-
+#ifdef HAVE_CUDA
+  #include "../CUDA/FilterGPU.h"
+#endif
 //----------------------------------------------------------------------------//
 
 AllPassFilter::AllPassFilter(float gain, long delay)
@@ -85,7 +87,9 @@ SoundSample *AllPassFilter::do_filter_SoundSample(SoundSample *inWave)
   
 	int i;
 	SoundSample *outWave;
-
+	#ifdef HAVE_CUDA
+	outWave = do_ap_filter_GPU(inWave,g,D);
+	#else
 	// create new SoundSample
 	outWave = new SoundSample(inWave->getSampleCount(),
 							  inWave->getSamplingRate());
@@ -95,7 +99,7 @@ SoundSample *AllPassFilter::do_filter_SoundSample(SoundSample *inWave)
 		(*outWave)[i] = do_filter((*inWave)[i]);
 //	outWave->operator[](i) = do_filter(inWave->operator[](i));
 	}
-
+	#endif
 	return outWave;
 }
 

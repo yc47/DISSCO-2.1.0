@@ -14,6 +14,7 @@ do { \
     } \
 } while (0)
 #define CEIL_MULT(x, y)  ( (( (x) + (y) - 1 ) / (y) ) * (y) )
+
 // Optimized node structure with 16-byte alignment
  
 
@@ -278,6 +279,28 @@ __global__ void LPCombFilterGPU(float *inputSample, float* outputSample, float i
             Zsrc[0] +=outputSample[j*delay-1];
     }
 }
+SoundSample* do_lp_filter_GPU(SoundSample *inWave, float lpf_g, float g, long d){
+    
+    float* inWaveData = inWave->getData();
+    long sampleSize = inWave->getSampleCount();
+    SoundSample *outWave = new SoundSample(sampleSize, inWave->getSamplingRate());
+    float* outWaveData, *dbuff0,*dbuff1; 
+    float* inWaveDataD;
+    CUDA_CHECK(cudaMalloc(&inWaveDataD,sampleSize*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&outWaveData,sampleSize*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dbuff0, CEIL_MULT(d, 256)*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dbuff1, CEIL_MULT(d, 256)*sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(inWaveDataD, inWaveData, sampleSize * sizeof(float), cudaMemcpyHostToDevice));
+    LPCombFilterGPU<<<1,256>>>(inWaveDataD, outWaveData, g, d, lpf_g, dbuff0, dbuff1,sampleSize);
+
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    
+    CUDA_CHECK(cudaMemcpy(outWave->getData(), outWaveData, sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+    return outWave;                    
+
+}
 
 __global__ void HexAllPassFilterGPU(float *inputSample, float *inputSample0, float *inputSample1, float *inputSample2, float *inputSample3, float *inputSample4, float *inputSample5, float* outputSample, float* envData, float inputGain, long inputDelay, float *delaybuf0, float *delaybuf1, long sampleSize){
     float gain=inputGain, gsqrd=gain*gain, x;
@@ -307,6 +330,54 @@ __global__ void HexAllPassFilterGPU(float *inputSample, float *inputSample0, flo
         }
     }
 }
+__global__ void AllPassFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float *delaybuf0, float *delaybuf1, long sampleSize){
+    float gain=inputGain, gsqrd=gain*gain, x;
+    int tx = threadIdx.x, idx;
+    long delay = inputDelay, ps=(double)(sampleSize+delay-1)/delay, pb=(double)(delay+blockDim.x-1)/blockDim.x;
+    
+
+    for (int i = 0; i < pb; ++i){
+        idx = i*blockDim.x + tx;
+        if (idx < delay){
+            delaybuf0[blockDim.x*i+threadIdx.x] = inputSample[idx];
+            delaybuf1[blockDim.x*i+threadIdx.x] = -gain*delaybuf0[blockDim.x*i+threadIdx.x];
+            outputSample[idx] = delaybuf1[blockDim.x*i+threadIdx.x] + (1-gain)*delaybuf0[blockDim.x*i+threadIdx.x];
+        }
+    }
+
+    for(int i=1; i<ps; ++i){
+        for (int j = 0; j < pb; ++j){
+            idx = j*blockDim.x + tx;
+            if (idx < delay&& i*delay+idx < sampleSize){
+                x=delaybuf0[blockDim.x*j+threadIdx.x];
+                delaybuf0[blockDim.x*j+threadIdx.x] = inputSample[i*delay+idx];
+                delaybuf1[blockDim.x*j+threadIdx.x] = -gain*delaybuf0[blockDim.x*j+threadIdx.x]+(1-gsqrd)*(gain*delaybuf1[blockDim.x*j+threadIdx.x]+x);
+                outputSample[i*delay+idx] = delaybuf1[blockDim.x*j+threadIdx.x]+(1-gain)*delaybuf0[blockDim.x*j+threadIdx.x];
+            }
+        }
+    }
+}
+
+SoundSample* do_ap_filter_GPU(SoundSample *inWave, float g, long d){
+     long dd = d;
+     long sampleSize = inWave->getSampleCount();
+    float* inWaveData = inWave->getData();
+    SoundSample *outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
+    float* outWaveData, *dbuff0, *dbuff1; 
+    float* inWaveDataD;
+    CUDA_CHECK(cudaMalloc(&inWaveDataD,sampleSize*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&outWaveData,sampleSize*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dbuff0, CEIL_MULT(dd, 256)*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dbuff1, CEIL_MULT(dd, 256)*sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(inWaveDataD, inWaveData, sampleSize * sizeof(float), cudaMemcpyHostToDevice));
+    AllPassFilterGPU<<<1,256>>>(inWaveDataD, outWaveData, g, d, dbuff0, dbuff1, sampleSize);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(outWave->getData(), outWaveData,
+                          sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+    return outWave;                    
+
+}
+
 
 __global__ void getEnvData(float *xyPoints, int *segmentTypes, float *envData, int segmentSize, long sampleSize){
     int tx = blockDim.x*blockIdx.x+threadIdx.x, samples, idx, start, i, j;

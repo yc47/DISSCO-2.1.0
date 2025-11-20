@@ -62,12 +62,12 @@ Piece
 | | +-Continuum
 | | | . Name: sp1
 | | | +-Parameters
-| | | | . Start: 0.84
+| | | | . Start: 0.93
 | | | | . Duration: 5.00
 | | | | . Max Duration: 5.00 sec.
 | | | | End Parameters
 | | | +-Seconds
-| | | | . Start: 0.84 sec.
+| | | | . Start: 0.93 sec.
 | | | | . Duration: 5.00 sec.
 | | | | End Seconds
 | | | +-EDU
@@ -79,46 +79,12 @@ Piece
 | | +-Continuum
 | | | . Name: sp1
 | | | +-Parameters
-| | | | . Start: 0.78
+| | | | . Start: 0.31
 | | | | . Duration: 5.00
 | | | | . Max Duration: 5.00 sec.
 | | | | End Parameters
 | | | +-Seconds
-| | | | . Start: 0.78 sec.
-| | | | . Duration: 5.00 sec.
-| | | | End Seconds
-| | | +-EDU
-| | | | . Start: indeterminate EDU
-| | | | . Duration: indeterminate EDU
-| | | | End EDU
-| | | . Checkpoint: 0.03 of parent
-| | | End Continuum
-| | +-Continuum
-| | | . Name: sp1
-| | | +-Parameters
-| | | | . Start: 0.91
-| | | | . Duration: 5.00
-| | | | . Max Duration: 5.00 sec.
-| | | | End Parameters
-| | | +-Seconds
-| | | | . Start: 0.91 sec.
-| | | | . Duration: 5.00 sec.
-| | | | End Seconds
-| | | +-EDU
-| | | | . Start: indeterminate EDU
-| | | | . Duration: indeterminate EDU
-| | | | End EDU
-| | | . Checkpoint: 0.03 of parent
-| | | End Continuum
-| | +-Continuum
-| | | . Name: sp1
-| | | +-Parameters
-| | | | . Start: 0.34
-| | | | . Duration: 5.00
-| | | | . Max Duration: 5.00 sec.
-| | | | End Parameters
-| | | +-Seconds
-| | | | . Start: 0.34 sec.
+| | | | . Start: 0.31 sec.
 | | | | . Duration: 5.00 sec.
 | | | | End Seconds
 | | | +-EDU
@@ -130,12 +96,29 @@ Piece
 | | +-Continuum
 | | | . Name: sp1
 | | | +-Parameters
-| | | | . Start: 0.28
+| | | | . Start: 0.75
 | | | | . Duration: 5.00
 | | | | . Max Duration: 5.00 sec.
 | | | | End Parameters
 | | | +-Seconds
-| | | | . Start: 0.28 sec.
+| | | | . Start: 0.75 sec.
+| | | | . Duration: 5.00 sec.
+| | | | End Seconds
+| | | +-EDU
+| | | | . Start: indeterminate EDU
+| | | | . Duration: indeterminate EDU
+| | | | End EDU
+| | | . Checkpoint: 0.03 of parent
+| | | End Continuum
+| | +-Continuum
+| | | . Name: sp1
+| | | +-Parameters
+| | | | . Start: 0.45
+| | | | . Duration: 5.00
+| | | | . Max Duration: 5.00 sec.
+| | | | End Parameters
+| | | +-Seconds
+| | | | . Start: 0.45 sec.
 | | | | . Duration: 5.00 sec.
 | | | | End Seconds
 | | | +-EDU
@@ -144,69 +127,86 @@ Piece
 | | | | End EDU
 | | | . Checkpoint: 0.01 of parent
 | | | End Continuum
+| | +-Continuum
+| | | . Name: sp1
+| | | +-Parameters
+| | | | . Start: 0.83
+| | | | . Duration: 5.00
+| | | | . Max Duration: 5.00 sec.
+| | | | End Parameters
+| | | +-Seconds
+| | | | . Start: 0.83 sec.
+| | | | . Duration: 5.00 sec.
+| | | | End Seconds
+| | | +-EDU
+| | | | . Start: indeterminate EDU
+| | | | . Duration: indeterminate EDU
+| | | | End EDU
+| | | . Checkpoint: 0.03 of parent
+| | | End Continuum
 | | +-Sound
 | | | . Name: sp1
 | | | . Type: 0
-| | | . Start Time: 0.84 sec.
-| | | . End Time: 5.84 sec.
+| | | . Start Time: 0.93 sec.
+| | | . End Time: 5.93 sec.
 | | | . Duration: 5.00 sec.
-| | | . Base Frequency: 622.25 Hz
+| | | . Base Frequency: 369.99 Hz
 | | | . Loudness: 100.00 sones
 | | | +-Partials
 | | | | . Deviation: 0.00 normalized
-| | | | . Fundamental: 622.25 Hz
+| | | | . Fundamental: 369.99 Hz
 | | | | End Partials
 | | | End Sound
 | | +-Sound
 | | | . Name: sp1
 | | | . Type: 0
-| | | . Start Time: 0.78 sec.
-| | | . End Time: 5.78 sec.
+| | | . Start Time: 0.31 sec.
+| | | . End Time: 5.31 sec.
 | | | . Duration: 5.00 sec.
-| | | . Base Frequency: 329.63 Hz
+| | | . Base Frequency: 349.23 Hz
 | | | . Loudness: 100.00 sones
 | | | +-Partials
 | | | | . Deviation: 0.00 normalized
-| | | | . Fundamental: 329.63 Hz
+| | | | . Fundamental: 349.23 Hz
 | | | | End Partials
 | | | End Sound
 | | +-Sound
 | | | . Name: sp1
 | | | . Type: 0
-| | | . Start Time: 0.91 sec.
-| | | . End Time: 5.91 sec.
+| | | . Start Time: 0.75 sec.
+| | | . End Time: 5.75 sec.
 | | | . Duration: 5.00 sec.
-| | | . Base Frequency: 2217.46 Hz
+| | | . Base Frequency: 554.37 Hz
 | | | . Loudness: 100.00 sones
 | | | +-Partials
 | | | | . Deviation: 0.00 normalized
-| | | | . Fundamental: 2217.46 Hz
+| | | | . Fundamental: 554.37 Hz
 | | | | End Partials
 | | | End Sound
 | | +-Sound
 | | | . Name: sp1
 | | | . Type: 0
-| | | . Start Time: 0.34 sec.
-| | | . End Time: 5.34 sec.
+| | | . Start Time: 0.45 sec.
+| | | . End Time: 5.45 sec.
 | | | . Duration: 5.00 sec.
-| | | . Base Frequency: 146.83 Hz
+| | | . Base Frequency: 698.46 Hz
 | | | . Loudness: 100.00 sones
 | | | +-Partials
 | | | | . Deviation: 0.00 normalized
-| | | | . Fundamental: 146.83 Hz
+| | | | . Fundamental: 698.46 Hz
 | | | | End Partials
 | | | End Sound
 | | +-Sound
 | | | . Name: sp1
 | | | . Type: 0
-| | | . Start Time: 0.28 sec.
-| | | . End Time: 5.28 sec.
+| | | . Start Time: 0.83 sec.
+| | | . End Time: 5.83 sec.
 | | | . Duration: 5.00 sec.
-| | | . Base Frequency: 207.65 Hz
+| | | . Base Frequency: 1479.98 Hz
 | | | . Loudness: 100.00 sones
 | | | +-Partials
 | | | | . Deviation: 0.00 normalized
-| | | | . Fundamental: 207.65 Hz
+| | | | . Fundamental: 1479.98 Hz
 | | | | End Partials
 | | | End Sound
 | | . Updated Tempo Start Time: 0.00

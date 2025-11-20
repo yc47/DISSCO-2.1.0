@@ -235,13 +235,8 @@ void Reverb::ConstructorCommon(Envelope *percentReverbinput, float *comb_gain_li
   // Make an all pass filter
   allPassDelay = delay;
   apfilter = new AllPassFilter(gainAllPass, (long)((m_time_type)allPassDelay*samplingRate) );
-  bq = new BiQuadFilter(
-    BiQuadFilter::LPF,   // type
-    0.0f,              // dB gain (ignored for LPF/HPF/NOTCH; kept for completeness)
-    2000.0f,           // center/cutoff frequency in Hz
-    44100.0f,          // sample rate in Hz
-    1.0f               // bandwidth in octaves (used in alpha computation)
-);
+  bq = new BiQuadFilter(BiQuadFilter::HSH, /*dbGain=*/6.0, /*freq=*/8000.0, /*srate=*/44100.0, /*bandwidth=*/1.0);
+
 x_at = 0;
   // Find the decay time
   float alpha = 0.0; // alpha is the steady state gain (which is also the max of the gain fn
@@ -284,7 +279,18 @@ m_sample_type Reverb::do_reverb(m_sample_type x_t, float x_value, Envelope *perc
   // run the sample through various comb filters (for effeciency
   // reasons, I hard coded this (instead of looping from 0 to
   // (REVERB_NUM_COMB_FILTERS-1).
-  y  = bq->do_filter(x_t);
+  int cases = 1;
+  switch(cases){
+    case 0:
+    y  = bq->do_filter(x_t);
+    break;
+
+    case 1:
+    y = lpcfilter[0]->do_filter(x_t);
+    y = apfilter->do_filter(y);
+    break;
+  }
+  
   // Mix it with the input sound
 
   
@@ -410,6 +416,7 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percen
 
   #ifdef HAVE_CUDA
 // Measure GPU time
+/*
 auto gpu_start = std::chrono::high_resolution_clock::now();
 outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
 outWave = bq->do_filter_SoundSample(inWave);  // GPU method
@@ -428,7 +435,20 @@ for(i=0; i<inWave->getSampleCount(); i++){
 }
 auto cpu_end = std::chrono::high_resolution_clock::now();
 printf("%d cpu: %.3f ms\n", hash,
-    std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());/*
+    std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());*/
+    outWave = lpcfilter[0]->do_filter_SoundSample(inWave);
+    outWave = apfilter->do_filter_SoundSample(outWave);
+    cout << "outwave 0 " << (*outWave)[0] << endl;
+    cout << "outwave 1000 " << (*outWave)[1000] << endl;
+    cout << "outwave 10000 " << (*outWave)[10000] << endl;
+    cout << "outwave 100000 " << (*outWave)[100000] << endl;
+    SoundSample* outWaved = new SoundSample(inWave->getSampleCount(),
+	  		    inWave->getSamplingRate());
+
+    for(i=0;i<inWave->getSampleCount();i++)
+      (*outWaved)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
+			      , percentReverb);
+    /*
     std::vector<float> y(inWave->getSampleCount(), 0.0);
 
     for (size_t n = 0; n < inWave->getSampleCount(); ++n) {
