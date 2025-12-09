@@ -109,14 +109,7 @@ public:
 	void xml_read( XmlReader::xmltag *apftag);
 
 	SoundSample *do_filter_SoundSample(SoundSample *inWave);
-
-	float get_g();
-	long get_D();
-private:
-	/**
-	 * The gain for the comb component of the filter
-	 **/
-	float g;
+float g;
 
 	/**
 	 * The square of the gain
@@ -127,6 +120,13 @@ private:
 	 * The delay for the comb component of the filter
 	 **/
 	long D;
+	float get_g();
+	long get_D();
+private:
+	/**
+	 * The gain for the comb component of the filter
+	 **/
+	
 
 	/**
 	 * This queue holds past samples to implement the delay

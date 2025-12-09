@@ -330,50 +330,98 @@ __global__ void HexAllPassFilterGPU(float *inputSample, float *inputSample0, flo
         }
     }
 }
-__global__ void AllPassFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float *delaybuf0, float *delaybuf1, long sampleSize){
-    float gain=inputGain, gsqrd=gain*gain, x;
-    int tx = threadIdx.x, idx;
-    long delay = inputDelay, ps=(double)(sampleSize+delay-1)/delay, pb=(double)(delay+blockDim.x-1)/blockDim.x;
+__global__ void AllPassFilterGPU(
+    float *inputSample, 
+    float *buf0,  // Buffer for c coefficients (size: sampleSize)
+    float *buf1,  // Buffer for a powers (size: sampleSize)
+    float inputGain, 
+    float c1,
+    float c2,
+    long inputDelay, 
+
+    long sampleSize
+    )   // Starting offset for this wave
+{
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float g = inputGain;
+    long D = inputDelay;
+    float* temp;
+    float *b0 = buf0;
+    float *b1 = buf1;
+    float m = c2;
+    long loop_count = (sampleSize + (blockDim.x * gridDim.x) - 1)/(blockDim.x * gridDim.x);
+    for(long i = 0; i < loop_count; i++){
+        if(i*blockDim.x * gridDim.x + idx < sampleSize){
+            b0[i*blockDim.x * gridDim.x + idx] = -g*inputSample[i*blockDim.x * gridDim.x + idx];
+            b1[i*blockDim.x * gridDim.x + idx] = -g*inputSample[i*blockDim.x * gridDim.x + idx];
+        }
+        if(i*blockDim.x * gridDim.x + idx < sampleSize && i*blockDim.x * gridDim.x + idx >= D){
+            b0[i*blockDim.x * gridDim.x + idx ] += c1*inputSample[i*blockDim.x * gridDim.x + idx - D];
+            b1[i*blockDim.x * gridDim.x + idx] += c1*inputSample[i*blockDim.x * gridDim.x + idx - D];
+        } 
+    }
+
+ 
+     
     
-
-    for (int i = 0; i < pb; ++i){
-        idx = i*blockDim.x + tx;
-        if (idx < delay){
-            delaybuf0[blockDim.x*i+threadIdx.x] = inputSample[idx];
-            delaybuf1[blockDim.x*i+threadIdx.x] = -gain*delaybuf0[blockDim.x*i+threadIdx.x];
-            outputSample[idx] = delaybuf1[blockDim.x*i+threadIdx.x] + (1-gain)*delaybuf0[blockDim.x*i+threadIdx.x];
+    
+        /*
+            
+    long stride = D;    
+    for(long i = 0; i < loop_count; i++){
+        if(i*blockDim.x * gridDim.x + idx  >= stride && i*blockDim.x * gridDim.x + idx  < 2*stride){
+         b1[i*blockDim.x * gridDim.x + idx ] += m * b0[i*blockDim.x * gridDim.x + idx  - stride];
         }
+        else{
+            b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx ];
+        }
+        
     }
-
-    for(int i=1; i<ps; ++i){
-        for (int j = 0; j < pb; ++j){
-            idx = j*blockDim.x + tx;
-            if (idx < delay&& i*delay+idx < sampleSize){
-                x=delaybuf0[blockDim.x*j+threadIdx.x];
-                delaybuf0[blockDim.x*j+threadIdx.x] = inputSample[i*delay+idx];
-                delaybuf1[blockDim.x*j+threadIdx.x] = -gain*delaybuf0[blockDim.x*j+threadIdx.x]+(1-gsqrd)*(gain*delaybuf1[blockDim.x*j+threadIdx.x]+x);
-                outputSample[i*delay+idx] = delaybuf1[blockDim.x*j+threadIdx.x]+(1-gain)*delaybuf0[blockDim.x*j+threadIdx.x];
+    temp = b0;
+        b0 = b1;
+        b1 = temp;
+        m = m*m;
+        
+        
+        */
+            
+    for(long stride = D; stride < (sampleSize+1)/2; stride = stride*2){
+         __syncthreads();
+        for(long i = 0; i < loop_count; i++){
+            if(i*blockDim.x * gridDim.x + idx  >= stride && i*blockDim.x * gridDim.x + idx  < sampleSize){
+             b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx] + m * b0[i*blockDim.x * gridDim.x + idx  - stride];
             }
+            else{
+                b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx ];
+            }
+            
         }
+        temp = b0;
+            b0 = b1;
+            b1 = temp;
+            m = m*m;
+       
     }
-}
 
+    
+}
+ 
 SoundSample* do_ap_filter_GPU(SoundSample *inWave, float g, long d){
-     long dd = d;
+
      long sampleSize = inWave->getSampleCount();
     float* inWaveData = inWave->getData();
     SoundSample *outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-    float* outWaveData, *dbuff0, *dbuff1; 
+    float* outWaveData, *dbuff0; 
     float* inWaveDataD;
     CUDA_CHECK(cudaMalloc(&inWaveDataD,sampleSize*sizeof(float)));
     CUDA_CHECK(cudaMalloc(&outWaveData,sampleSize*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dbuff0, CEIL_MULT(dd, 256)*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dbuff1, CEIL_MULT(dd, 256)*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dbuff0, CEIL_MULT(d, 256)*sizeof(float)));
     CUDA_CHECK(cudaMemcpy(inWaveDataD, inWaveData, sampleSize * sizeof(float), cudaMemcpyHostToDevice));
-    AllPassFilterGPU<<<1,256>>>(inWaveDataD, outWaveData, g, d, dbuff0, dbuff1, sampleSize);
+    AllPassFilterGPU<<<1,256>>>(inWaveDataD,  dbuff0,outWaveData,g, 1-g*g, (1-(g*g))*g, d, sampleSize);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(outWave->getData(), outWaveData,
                           sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+     
     return outWave;                    
 
 }

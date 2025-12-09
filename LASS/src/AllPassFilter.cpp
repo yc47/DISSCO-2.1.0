@@ -86,13 +86,12 @@ SoundSample *AllPassFilter::do_filter_SoundSample(SoundSample *inWave)
   
   
 	int i;
-	SoundSample *outWave;
+	SoundSample *outWave= new SoundSample(inWave->getSampleCount(),inWave->getSamplingRate());
 	#ifdef HAVE_CUDA
 	outWave = do_ap_filter_GPU(inWave,g,D);
 	#else
 	// create new SoundSample
-	outWave = new SoundSample(inWave->getSampleCount(),
-							  inWave->getSamplingRate());
+
 
 	for(i=0;i<inWave->getSampleCount();i++)
 	{
