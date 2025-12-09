@@ -214,13 +214,9 @@ SoundSample* do_biquad_filter_GPU(
     CUDA_CHECK(cudaMemcpy(outWave->getData(), d_output,
                           sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
     
-    // Print sample outputs for verification
-    cout << "outwave 0 " << (*outWave)[0] << endl;
-    cout << "outwave 1000 " << (*outWave)[1000] << endl;
-    cout << "outwave 10000 " << (*outWave)[10000] << endl;
-    cout << "outwave 100000 " << (*outWave)[100000] << endl;
+
     
-    // Cleanup - only 2 frees instead of 4
+
     CUDA_CHECK(cudaFree(d_float_base));
     CUDA_CHECK(cudaFree(d_node_base));
     
@@ -361,29 +357,6 @@ __global__ void AllPassFilterGPU(
         } 
     }
 
- 
-     
-    
-    
-        /*
-            
-    long stride = D;    
-    for(long i = 0; i < loop_count; i++){
-        if(i*blockDim.x * gridDim.x + idx  >= stride && i*blockDim.x * gridDim.x + idx  < 2*stride){
-         b1[i*blockDim.x * gridDim.x + idx ] += m * b0[i*blockDim.x * gridDim.x + idx  - stride];
-        }
-        else{
-            b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx ];
-        }
-        
-    }
-    temp = b0;
-        b0 = b1;
-        b1 = temp;
-        m = m*m;
-        
-        
-        */
             
     for(long stride = D; stride < (sampleSize+1)/2; stride = stride*2){
          __syncthreads();

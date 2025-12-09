@@ -80,13 +80,11 @@ SoundSample *LPCombFilter::do_filter_SoundSample(SoundSample *inWave)
   
   
 	int i;
-	SoundSample *outWave;
+	SoundSample* outWave = new SoundSample(inWave->getSampleCount(),inWave->getSamplingRate());
 	#ifdef HAVE_CUDA
 	outWave = do_lp_filter_GPU(inWave,lpf_g,g,D);
 	#else
 	// create new SoundSample
-	outWave = new SoundSample(inWave->getSampleCount(),
-							  inWave->getSamplingRate());
 
 	for(i=0;i<inWave->getSampleCount();i++)
 	{

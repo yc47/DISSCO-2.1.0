@@ -19,7 +19,7 @@
 #define __MOSS_REVERB_CPP
 
 //----------------------------------------------------------------------------//
-#include <cstdlib>
+
 #include "SoundSample.h"
 #include "Collection.h"
 #include "Track.h"
@@ -235,9 +235,7 @@ void Reverb::ConstructorCommon(Envelope *percentReverbinput, float *comb_gain_li
   // Make an all pass filter
   allPassDelay = delay;
   apfilter = new AllPassFilter(gainAllPass, (long)((m_time_type)allPassDelay*samplingRate) );
-  bq = new BiQuadFilter(BiQuadFilter::HSH, /*dbGain=*/6.0, /*freq=*/8000.0, /*srate=*/44100.0, /*bandwidth=*/1.0);
 
-x_at = 0;
   // Find the decay time
   float alpha = 0.0; // alpha is the steady state gain (which is also the max of the gain fn
 #define max(x,y) ((x) > (y) ? (x) : (y))
@@ -257,7 +255,7 @@ Reverb::~Reverb()
 
   for(i=0;i<REVERB_NUM_COMB_FILTERS;i++)
     delete lpcfilter[i];
-  delete bq;
+
   delete apfilter;
   delete percentReverb;
 }
@@ -279,33 +277,34 @@ m_sample_type Reverb::do_reverb(m_sample_type x_t, float x_value, Envelope *perc
   // run the sample through various comb filters (for effeciency
   // reasons, I hard coded this (instead of looping from 0 to
   // (REVERB_NUM_COMB_FILTERS-1).
-  int cases = 1;
-  switch(cases){
-    case 0:
-    y  = bq->do_filter(x_t);
-    break;
+  y  = lpcfilter[0]->do_filter(x_t);
+  y += lpcfilter[1]->do_filter(x_t);
+  y += lpcfilter[2]->do_filter(x_t);
+  y += lpcfilter[3]->do_filter(x_t);
+  y += lpcfilter[4]->do_filter(x_t);
+  y += lpcfilter[5]->do_filter(x_t);
+  y /= (m_sample_type)REVERB_NUM_COMB_FILTERS;
 
-    case 1:
-    //y = lpcfilter[0]->do_filter(x_t);
-    y = apfilter->do_filter(x_t);
-    break;
-  }
-  
+
+  // after adding up the results, run it through an allpass filter
+  y = apfilter->do_filter(y);
   // Mix it with the input sound
-
+  float durationofEnv = percentReverb->getDuration();
+  float EnvelopeValueAtx = percentReverb->getValue(x_value,durationofEnv);
+  y = (EnvelopeValueAtx*y) + ((1 - EnvelopeValueAtx)*x_t);
   
-   if(x_at == 0)
-     cout<<"y0 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
+  // if(x_at == 0)
+  //   cout<<"y0 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
   
-   if(x_at == 1000)
-     cout<<"y1000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
+  // if(x_at == 1000)
+  //   cout<<"y1000 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
   
-   if(x_at == 10000)
-     cout<<"y10000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
+  // if(x_at == 10000)
+  //   cout<<"y10000 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
   
-   if(x_at == 25000)
-     cout<<"y100000 "<<y<<endl<<"EvenlopeValueAtx "<<"EnvelopeValueAtx"<<endl;
-   x_at++;
+  // if(x_at == 100000)
+  //   cout<<"y100000 "<<y<<endl<<"EvenlopeValueAtx "<<EnvelopeValueAtx<<endl;
+  // x_at++;
 
   return y;
 }
@@ -326,7 +325,6 @@ void Reverb::reset(void)
   for(i=0;i<REVERB_NUM_COMB_FILTERS;i++)
     lpcfilter[i]->reset();
   apfilter->reset();
-  bq->reset();
 }
 
 /**
@@ -407,116 +405,22 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave)
 }
 SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percentReverbinput)
 {
-  int hash = rand()%12567;
+
   int i;
   SoundSample *outWave;  
-  SoundSample *bro;
   Envelope* temp = new Envelope(*percentReverbinput);
   delete percentReverb;
   percentReverb = temp;
-
+  outWave = new SoundSample(inWave->getSampleCount(),inWave->getSamplingRate());
   #ifdef HAVE_CUDA
-  outWave = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());
-  bro = new SoundSample(inWave->getSampleCount(),
-  inWave->getSamplingRate());
-    for(i=0;i<inWave->getSampleCount();i++){
-      (*outWave)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
-			      , percentReverb);
-            }
-  SoundSample* outputSample = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());          
-  long sampleSize =     inWave->getSampleCount();
-  for (long n = 0; n < sampleSize; n++) {
-    (*outputSample)[n] = 0;
-  }
-    float g = apfilter->g;
-    long D = apfilter->D;
-
-    for (long n = 0; n < sampleSize; n++) {
-      float x_n = (*inWave)[n];
-      float x_n_minus_D = (n >= D) ? (*inWave)[n - D] : 0.0f;
-      float y_n_minus_D = (n >= D) ? (*outputSample)[n - D] : 0.0f;
-      
-      // Direct formula: y[n] = -g*x[n] + (1-g²)*(x[n-D] + g*y[n-D])
-      (*outputSample)[n] = -g * x_n + (1-g*g) * (x_n_minus_D + g * y_n_minus_D);
-  }
-  cout << (*outputSample)[0] << " "<< hash << endl;
-    cout << (*outputSample)[D-2] << endl;
-    cout << (*outputSample)[10000] << endl;
-    cout << (*outputSample)[100000] << endl;
-
-    bro = apfilter->do_filter_SoundSample(inWave);
-    cout << "outwave 0 " << hash << " " << (*bro)[0] << endl;
-    cout << "outwave 1000 " << (*bro)[D-2] << endl;
-    cout << "outwave 10000 " << (*bro)[10000] << endl;
-    cout << "outwave 100000 " << (*bro)[100000] << endl;
-     
-    cout<<(*bro)[D-1]<<" "<< (*bro)[D]<<" "<<(*bro)[D+1]<<endl;
-    cout<<(*outputSample)[D-1]<<" "<< (*outputSample)[D]<<" "<<(*outputSample)[D+1]<<endl;
-    cout<< "d" << D<<endl;
-    delete(outputSample);
- 
-    delete(bro);
-// Measure GPU time
-/*
-auto gpu_start = std::chrono::high_resolution_clock::now();
-outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-outWave = bq->do_filter_SoundSample(inWave);  // GPU method
-cudaDeviceSynchronize();  // ⭐ CRITICAL: Wait for GPU to finish!
-auto gpu_end = std::chrono::high_resolution_clock::now();
-printf("%d gpu: %.3f ms\n", hash,
-    std::chrono::duration<double, std::milli>(gpu_end - gpu_start).count());
-
-// Measure CPU time separately
-auto cpu_start = std::chrono::high_resolution_clock::now();
-outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-for(i=0; i<inWave->getSampleCount(); i++){
-    (*outWave)[i] = do_reverb((*inWave)[i], 
-                              (float)i / inWave->getSampleCount(), 
-                              percentReverb);
-}
-auto cpu_end = std::chrono::high_resolution_clock::now();
-printf("%d cpu: %.3f ms\n", hash,
-    std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());
-    outWave = lpcfilter[0]->do_filter_SoundSample(inWave);
-    outWave = apfilter->do_filter_SoundSample(outWave);
-    cout << "outwave 0 " << (*outWave)[0] << endl;
-    cout << "outwave 1000 " << (*outWave)[1000] << endl;
-    cout << "outwave 10000 " << (*outWave)[10000] << endl;
-    cout << "outwave 100000 " << (*outWave)[100000] << endl;
-    SoundSample* outWaved = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());
-
-    for(i=0;i<inWave->getSampleCount();i++)
-      (*outWaved)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
-			      , percentReverb);*/
-    
-    /*
-    std::vector<float> y(inWave->getSampleCount(), 0.0);
-
-    for (size_t n = 0; n < inWave->getSampleCount(); ++n) {
-        float x0 = (*inWave)[n];
-        float x1 = (n >= 1) ? (*inWave)[n - 1] : 0.0;
-        float x2 = (n >= 2) ? (*inWave)[n - 2] : 0.0;
-        float y1 = (n >= 1) ? y[n - 1] : 0.0;
-        float y2 = (n >= 2) ? y[n - 2] : 0.0;
-
-        y[n] = bq->ba0 * x0 + bq->ba1 * x1 + bq->ba2 * x2 - bq->ba1 * y1 - bq->ba2 * y2;
-    }
-    cout << y[0] << endl;
-    cout << y[1000] << endl;
-    cout << y[10000] << endl;
-    cout << y[100000] << endl;*/
+  outWave=do_reverb_SoundSample_GPU(inWave, percentReverb, lpcfilter, apfilter);
   #else
     // create new SoundSample
-    outWave = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());
+    
 
     for(i=0;i<inWave->getSampleCount();i++)
       (*outWave)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
 			      , percentReverb);
-            
   #endif
 
   return outWave;

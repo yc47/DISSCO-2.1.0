@@ -93,17 +93,7 @@ public:
          *   This outputs an XML representation of the object to STDOUT
         **/
 	void xml_print();
-		enum {
-    	LPF, /* low pass filter */
-    	HPF, /* High pass filter */
-    	BPF, /* band pass filter */
-    	NOTCH, /* Notch Filter */
-    	PEQ, /* Peaking band EQ filter */
-    	LSH, /* Low shelf filter */
-    	HSH /* High shelf filter */
-	};
-	m_sample_type ba0, ba1, ba2, ba3, ba4;
-    m_sample_type bx1, bx2, by1, by2;
+
 private:
 
 	/**
@@ -119,10 +109,19 @@ private:
 
 
 
-    	
+    	m_sample_type ba0, ba1, ba2, ba3, ba4;
+    	m_sample_type bx1, bx2, by1, by2;
 
 /* filter types */
-	
+	enum {
+    	LPF, /* low pass filter */
+    	HPF, /* High pass filter */
+    	BPF, /* band pass filter */
+    	NOTCH, /* Notch Filter */
+    	PEQ, /* Peaking band EQ filter */
+    	LSH, /* Low shelf filter */
+    	HSH /* High shelf filter */
+	};
 
 
 

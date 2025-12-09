@@ -91,8 +91,6 @@ SoundSample *AllPassFilter::do_filter_SoundSample(SoundSample *inWave)
 	outWave = do_ap_filter_GPU(inWave,g,D);
 	#else
 	// create new SoundSample
-
-
 	for(i=0;i<inWave->getSampleCount();i++)
 	{
 		(*outWave)[i] = do_filter((*inWave)[i]);
