@@ -42,52 +42,59 @@ __global__ void BiQuadFilterFused_Scan(
     float alpha1, float alpha2,
     long sampleSize)
 {
-    __shared__ AR2Node temp[256];
-    
+    // Double-buffered so each scan step needs one __syncthreads() instead of
+    // two: writes always land in the buffer nobody is reading this step, so
+    // there's no read-after-write hazard to guard against.
+    __shared__ AR2Node temp[2][256];
+
     int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + tid;
-    
+    long idx = (long)blockIdx.x * blockDim.x + tid;
+
+    AR2Node initial;
     // Compute feedforward and create node
     if (idx < sampleSize) {
         float x_n  = inputSample[idx];
         float x_n1 = (idx >= 1) ? inputSample[idx - 1] : 0.0f;
         float x_n2 = (idx >= 2) ? inputSample[idx - 2] : 0.0f;
-        
+
         float f_n = ba0 * x_n + ba1 * x_n1 + ba2 * x_n2;
-        
-        // Create node and load into shared memory
-        temp[tid].a00 = alpha1; temp[tid].a01 = alpha2;
-        temp[tid].a10 = 1.0f;   temp[tid].a11 = 0.0f;
-        temp[tid].b0 = f_n;     temp[tid].b1 = 0.0f;
+
+        initial.a00 = alpha1; initial.a01 = alpha2;
+        initial.a10 = 1.0f;   initial.a11 = 0.0f;
+        initial.b0 = f_n;     initial.b1 = 0.0f;
     } else {
         // Out of bounds - identity node
-        temp[tid].a00 = 1.0f; temp[tid].a01 = 0.0f;
-        temp[tid].a10 = 0.0f; temp[tid].a11 = 1.0f;
-        temp[tid].b0 = 0.0f;  temp[tid].b1 = 0.0f;
+        initial.a00 = 1.0f; initial.a01 = 0.0f;
+        initial.a10 = 0.0f; initial.a11 = 1.0f;
+        initial.b0 = 0.0f;  initial.b1 = 0.0f;
     }
+
+    int pout = 0;
+    temp[pout][tid] = initial;
     __syncthreads();
-    
+
     // Kogge-Stone inclusive scan within block
     for (int stride = 1; stride < blockDim.x; stride *= 2) {
-        AR2Node val;
+        int pin = pout;
+        pout = 1 - pout;
         if (tid >= stride) {
-            val = compose_nodes(temp[tid - stride], temp[tid]);
+            temp[pout][tid] = compose_nodes(temp[pin][tid - stride], temp[pin][tid]);
         } else {
-            val = temp[tid];
+            temp[pout][tid] = temp[pin][tid];
         }
         __syncthreads();
-        temp[tid] = val;
-        __syncthreads();
     }
-    
+
+    AR2Node result = temp[pout][tid];
+
     // Write back to global memory
     if (idx < sampleSize) {
-        outputNodes[idx] = temp[tid];
+        outputNodes[idx] = result;
     }
-    
+
     // Save last element of each block for inter-block scan
     if (tid == blockDim.x - 1 && block_results != nullptr) {
-        block_results[blockIdx.x] = temp[tid];
+        block_results[blockIdx.x] = result;
     }
 }
 
@@ -97,44 +104,48 @@ __global__ void block_scan_kogge_stone(
     AR2Node* __restrict__ block_results,
     long N)
 {
-    __shared__ AR2Node temp[256];
-    
+    __shared__ AR2Node temp[2][256];
+
     int tid = threadIdx.x;
-    int idx = blockIdx.x * blockDim.x + tid;
-    
+    long idx = (long)blockIdx.x * blockDim.x + tid;
+
+    AR2Node initial;
     // Load into shared memory
     if (idx < N) {
-        temp[tid] = data[idx];
+        initial = data[idx];
     } else {
         // Out of bounds - shouldn't affect results
-        temp[tid].a00 = 1.0f; temp[tid].a01 = 0.0f;
-        temp[tid].a10 = 0.0f; temp[tid].a11 = 1.0f;
-        temp[tid].b0 = 0.0f;  temp[tid].b1 = 0.0f;
+        initial.a00 = 1.0f; initial.a01 = 0.0f;
+        initial.a10 = 0.0f; initial.a11 = 1.0f;
+        initial.b0 = 0.0f;  initial.b1 = 0.0f;
     }
-    
-    
-    // Kogge-Stone inclusive scan
+
+    int pout = 0;
+    temp[pout][tid] = initial;
+    __syncthreads();
+
+    // Kogge-Stone inclusive scan (double-buffered: one sync per step)
     for (int stride = 1; stride < blockDim.x; stride *= 2) {
-        __syncthreads();
-        AR2Node val;
+        int pin = pout;
+        pout = 1 - pout;
         if (tid >= stride) {
-            val = compose_nodes(temp[tid - stride], temp[tid]);
+            temp[pout][tid] = compose_nodes(temp[pin][tid - stride], temp[pin][tid]);
         } else {
-            val = temp[tid];
+            temp[pout][tid] = temp[pin][tid];
         }
-      
-        temp[tid] = val;
-        
+        __syncthreads();
     }
-    
+
+    AR2Node result = temp[pout][tid];
+
     // Write back to global memory
     if (idx < N) {
-        data[idx] = temp[tid];
+        data[idx] = result;
     }
-    
+
     // Save last element of each block for inter-block scan
     if (tid == blockDim.x - 1 && block_results != nullptr) {
-        block_results[blockIdx.x] = temp[tid];
+        block_results[blockIdx.x] = result;
     }
 }
 
@@ -145,161 +156,434 @@ __global__ void AddPrefixAndExtract(
     float* __restrict__ output,
     long N)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < N) {
         // Add block prefix if not in first block
         AR2Node node = nodes[idx];
         if (blockIdx.x > 0) {
             node = compose_nodes(block_prefixes[blockIdx.x - 1], node);
         }
-        
+
         // Extract b0 to output
         output[idx] = node.b0;
     }
 }
 
+// KERNEL 3b: Same prefix composition as AddPrefixAndExtract, but keeps the
+// full AR2Node instead of extracting b0. Used to fold a higher scan level's
+// results back into a lower level's block sums, which is what lets the
+// multi-level scan in scanNodesRecursive() handle arbitrarily many blocks.
+__global__ void AddBlockPrefixInPlace(
+    AR2Node* __restrict__ nodes,
+    const AR2Node* __restrict__ block_prefixes,
+    long N)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < N && blockIdx.x > 0) {
+        nodes[idx] = compose_nodes(block_prefixes[blockIdx.x - 1], nodes[idx]);
+    }
+}
+
+// Total number of extra AR2Node slots scanNodesIterative() needs as scratch
+// space to scan an array of `numBlocks` elements: one block-sums array per
+// scan level, for every level beyond the first that doesn't fit in a single
+// block. Mirrors the level sizes scanNodesIterative() will actually walk
+// through, so the caller can size a single arena big enough up front.
+static long computeScanScratchNodes(long numBlocks, int threadsPerBlock)
+{
+    long extra = 0;
+    long count = numBlocks;
+    while (count > threadsPerBlock) {
+        long blocks = (count + threadsPerBlock - 1) / threadsPerBlock;
+        extra += blocks;
+        count = blocks;
+    }
+    return extra;
+}
+
+// Scans an AR2Node array of arbitrary length in place, turning it into a
+// fully-correct inclusive scan regardless of how many blocks it takes.
+//
+// block_scan_kogge_stone() only scans correctly *within* a block: with N
+// elements it produces `blocks = ceil(N/threadsPerBlock)` independent scan
+// runs whose boundaries haven't been reconciled with each other yet. This
+// walks down level by level (each level's block sums becoming the next
+// level's input) until everything fits in one block, then walks back up
+// folding each level's now-correct prefixes into the level below it - the
+// standard technique for scanning arrays larger than one block (as in
+// NVIDIA's "Parallel Prefix Sum" algorithm / Thrust's multi-level scan).
+//
+// d_scratch must point to at least computeScanScratchNodes(N, threadsPerBlock)
+// AR2Nodes; the caller carves it out of a persistent arena so this never
+// calls cudaMalloc/cudaFree itself. Recursion depth is O(log_256(N)), so 8
+// levels covers any realistic (or unrealistic) sample count.
+static void scanNodesIterative(AR2Node* d_data, long N, int threadsPerBlock, AR2Node* d_scratch)
+{
+    if (N <= 1) return; // a single element is already its own inclusive scan
+
+    AR2Node* levelData[8];
+    long levelN[8];
+    int depth = 0;
+
+    AR2Node* curData = d_data;
+    long curN = N;
+    AR2Node* scratchCursor = d_scratch;
+
+    // Down-sweep: scan each level's blocks, carving each level's block-sum
+    // array out of the pre-sized scratch arena, until one level's worth of
+    // block sums fits in a single block.
+    while (curN > threadsPerBlock) {
+        long blocks = (curN + threadsPerBlock - 1) / threadsPerBlock;
+        AR2Node* nextData = scratchCursor;
+        scratchCursor += blocks;
+
+        block_scan_kogge_stone<<<(int)blocks, threadsPerBlock>>>(curData, nextData, curN);
+
+        levelData[depth] = curData;
+        levelN[depth] = curN;
+        depth++;
+
+        curData = nextData;
+        curN = blocks;
+    }
+
+    // Top level fits in one block: scanning it in place is globally correct.
+    block_scan_kogge_stone<<<1, threadsPerBlock>>>(curData, nullptr, curN);
+
+    // Up-sweep: fold each level's fully-correct prefixes back into the level
+    // below it, from the top level back down to the original array.
+    for (int i = depth - 1; i >= 0; i--) {
+        long blocks = (levelN[i] + threadsPerBlock - 1) / threadsPerBlock;
+        AddBlockPrefixInPlace<<<(int)blocks, threadsPerBlock>>>(levelData[i], curData, levelN[i]);
+        curData = levelData[i];
+        curN = levelN[i];
+    }
+}
+
+// Persistent device scratch space for do_biquad_filter_GPU, grown on demand
+// and reused across calls instead of cudaMalloc/cudaFree'd every time.
+// Profiling (see Reverb::do_reverb_SoundSample's gpu/cpu timers) showed the
+// ~13 CUDA driver calls a single invocation used to make - 3 cudaMallocs,
+// 3 cudaFrees, 5 kernel launches, 2 memcpys - dominating wall-clock time for
+// typical buffer sizes, since the actual scan kernels finish in low
+// microseconds once the data fits in the GPU's L2 cache. Reusing these
+// arenas cuts steady-state calls down to just the memcpys and kernel
+// launches - no allocation calls at all once the arena has grown to the
+// largest sampleSize seen so far.
+//
+// Not thread-safe: do_biquad_filter_GPU is only ever called from a single
+// host thread in the current CMOD/LASSIE pipeline (reverb is applied
+// sequentially per track). If that changes, this needs a per-thread arena
+// or a mutex around the ensure*Arena() calls.
+namespace {
+    float* g_floatArena = nullptr;
+    long g_floatArenaCapacity = 0; // in floats
+
+    AR2Node* g_nodeArena = nullptr;
+    long g_nodeArenaCapacity = 0; // in AR2Node elements
+
+    float* ensureFloatArena(long neededFloats)
+    {
+        if (neededFloats > g_floatArenaCapacity) {
+            if (g_floatArena != nullptr) {
+                CUDA_CHECK(cudaFree(g_floatArena));
+            }
+            CUDA_CHECK(cudaMalloc(&g_floatArena, neededFloats * sizeof(float)));
+            g_floatArenaCapacity = neededFloats;
+        }
+        return g_floatArena;
+    }
+
+    AR2Node* ensureNodeArena(long neededNodes)
+    {
+        if (neededNodes > g_nodeArenaCapacity) {
+            if (g_nodeArena != nullptr) {
+                CUDA_CHECK(cudaFree(g_nodeArena));
+            }
+            CUDA_CHECK(cudaMalloc(&g_nodeArena, neededNodes * sizeof(AR2Node)));
+            g_nodeArenaCapacity = neededNodes;
+        }
+        return g_nodeArena;
+    }
+}
+
 // Host function: Complete biquad filter with custom kernels only
 SoundSample* do_biquad_filter_GPU(
-    SoundSample *inWave, 
-    float ba0, float ba1, float ba2, 
+    SoundSample *inWave,
+    float ba0, float ba1, float ba2,
     float ba3, float ba4)
 {
     long sampleSize = inWave->getSampleCount();
     SoundSample *outWave = new SoundSample(sampleSize, inWave->getSamplingRate());
-    
+
     // Calculate grid dimensions
     const int threadsPerBlock = 256;
-    const int numBlocks = (sampleSize + threadsPerBlock - 1) / threadsPerBlock;
-    
-    // Device memory pointers
-    float *d_float_base, *d_input, *d_output;
-    AR2Node *d_node_base, *d_nodes, *d_block_results;
-    
-    // Allocate device memory - merge allocations by type
-    // Allocate all float arrays together: d_input + d_output
-    CUDA_CHECK(cudaMalloc(&d_float_base, 2 * sampleSize * sizeof(float)));
+    const int numBlocks = (int)((sampleSize + threadsPerBlock - 1) / threadsPerBlock);
+    const long scanScratchNodes = computeScanScratchNodes(numBlocks, threadsPerBlock);
+
+    // Grab (and grow, if needed) the persistent arenas instead of allocating
+    // fresh device memory every call.
+    float *d_input, *d_output;
+    float* d_float_base = ensureFloatArena(2 * sampleSize);
     d_input = d_float_base;                    // First sampleSize floats
     d_output = d_float_base + sampleSize;      // Next sampleSize floats
-    
-    // Allocate all AR2Node arrays together: d_nodes + d_block_results
-    CUDA_CHECK(cudaMalloc(&d_node_base, (sampleSize + numBlocks) * sizeof(AR2Node)));
-    d_nodes = d_node_base;                     // First sampleSize nodes
-    d_block_results = d_node_base + sampleSize; // Next numBlocks nodes
-    
+
+    AR2Node *d_nodes, *d_block_results, *d_scan_scratch;
+    AR2Node* d_node_base = ensureNodeArena(sampleSize + numBlocks + scanScratchNodes);
+    d_nodes = d_node_base;                          // First sampleSize nodes
+    d_block_results = d_node_base + sampleSize;     // Next numBlocks nodes
+    d_scan_scratch = d_block_results + numBlocks;   // Remaining scratch for scanNodesIterative
+
     // Copy input to device
-    CUDA_CHECK(cudaMemcpy(d_input, inWave->getData(), 
+    CUDA_CHECK(cudaMemcpy(d_input, inWave->getData(),
                           sampleSize * sizeof(float), cudaMemcpyHostToDevice));
-    
-    // STEP 1: Merged feedforward + node creation + block scan
+
+    // STEP 1: Merged feedforward + node creation + per-block scan.
+    // No cudaDeviceSynchronize() here: kernels launched into the same
+    // (default) stream already execute in issued order on the GPU, so the
+    // host doesn't need to block and wait between them - only before reading
+    // the result back, which the final cudaMemcpy below already does.
     BiQuadFilterFused_Scan<<<numBlocks, threadsPerBlock>>>(
         d_input, d_nodes, d_block_results, ba0, ba1, ba2, -ba3, -ba4, sampleSize
     );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // STEP 2: Scan the block results (always run, even if numBlocks <= 1)
-    int blocks2 = (numBlocks + threadsPerBlock - 1) / threadsPerBlock;
-    block_scan_kogge_stone<<<blocks2, threadsPerBlock>>>(
-        d_block_results, nullptr, numBlocks
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // STEP 3: Add prefix and extract output
+
+    // STEP 2: Fully scan the block results, however many levels that takes.
+    scanNodesIterative(d_block_results, numBlocks, threadsPerBlock, d_scan_scratch);
+
+    // STEP 3: Add the now-correct block prefixes and extract output
     AddPrefixAndExtract<<<numBlocks, threadsPerBlock>>>(
         d_nodes, d_block_results, d_output, sampleSize
     );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // Copy result back to host
+
+    // Copy result back to host (blocking - this is what drains the stream)
     CUDA_CHECK(cudaMemcpy(outWave->getData(), d_output,
                           sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // Print sample outputs for verification
-    cout << "outwave 0 " << (*outWave)[0] << endl;
-    cout << "outwave 1000 " << (*outWave)[1000] << endl;
-    cout << "outwave 10000 " << (*outWave)[10000] << endl;
-    cout << "outwave 100000 " << (*outWave)[100000] << endl;
-    
-    // Cleanup - only 2 frees instead of 4
-    CUDA_CHECK(cudaFree(d_float_base));
-    CUDA_CHECK(cudaFree(d_node_base));
-    
+
     return outWave;
 }
-__global__ void LPCombFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float inputLpf_gain, float *delaybuf0, float *delaybuf1, long sampleSize){
-    float gain=inputGain, lpf_gain=inputLpf_gain;
-    double gaine;
-    int tx = threadIdx.x, idx;
-    long delay = inputDelay, ps=(double)(sampleSize+delay-1)/delay, pb=(double)(delay+blockDim.x-1)/blockDim.x;
-    //__shared__ float Z0[4096], Z1[4096];
-    float *Zsrc=delaybuf0, *Zdest=delaybuf1, *Ztemp;
+// Reproduces LPCombFilter::do_filter's coupled recurrence in parallel.
+// CPU reference (LPCombFilter.cpp + LowPassFilter.cpp):
+//   y[n] = x[n-D] + g*L[n-D]           (n >= D, else y[n] = 0)
+//   L[n] = y[n] + lpf_gain*L[n-1]      (L[-1] = 0)
+// where D is the comb delay and L is the internal lowpass filter's state,
+// advanced by exactly one step per comb call.
+//
+// Substituting y[n] shows L only depends on values one delay-block back
+// (L[n-D], via y[n-D]) and one step back (L[n-1]), so it can be computed one
+// delay-length block at a time: given L for block (j-1), block j's y values
+// are a plain elementwise formula, and L for block j is a single-pole scan
+// of those y values seeded with L's last value from block (j-1). That scan
+// is what the Hillis-Steele doubling loop below computes.
+//
+// The previous version of this kernel got the block decomposition right but
+// carried the wrong quantity between blocks (the comb's *output* value
+// instead of the lowpass filter's *internal state* L, and added it after
+// computing y instead of folding it into the scan's seed beforehand) -
+// confirmed wrong by the correctness check in Reverb::do_reverb_SoundSample.
+// LPCombFilterGPU used to do everything (the setup, every block's elementwise
+// step, and every block's Hillis-Steele scan) inside one <<<1,256>>> launch,
+// which caps the kernel at 256 GPU threads total regardless of delay length
+// or sample count - for a delay in the thousands and a sample count in the
+// hundreds of thousands, that meant one thread doing over a thousand
+// sequential loop iterations while the other ~16000 cores on the GPU sat
+// idle. Splitting each step into its own kernel, launched with
+// gridDim = ceil(delay/256), lets every block-local step use as many blocks
+// as the delay actually needs. The block-to-block sequential dependency
+// (block j needs block j-1's fully-scanned result) is preserved by simply
+// launching each block's kernels after the previous block's, in the same
+// stream - CUDA guarantees same-stream kernels run in launch order, which is
+// actually simpler to reason about than the old single-kernel version's
+// __syncthreads()-based bookkeeping.
 
-   for (int i = 0; i < pb; i++){
-        idx = i*blockDim.x + tx;
-        if (idx < delay)
-            outputSample[idx] = 0;
-    }
-
-    for (int i = 0; i < pb; i++){
-        idx = i*blockDim.x + tx;
-        if (idx < delay){
-            Zsrc[idx] = inputSample[idx];
-            outputSample[idx+delay] = Zsrc[idx];
+// Zero-fills output block 0 and sets Zsrc/output block 1 from the input,
+// exactly as LPComb's first two blocks are always 0 and a direct passthrough
+// of the input (see do_lp_filter_GPU's comment for the math).
+__global__ void LPCombSetup(
+    const float* __restrict__ inputSample,
+    float* __restrict__ outputSample,
+    float* __restrict__ Zsrc,
+    long delay,
+    long sampleSize)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < delay) {
+        if (idx < sampleSize) {
+            outputSample[idx] = 0.0f;
         }
-    }
-
-    for(int j=2; j<ps; ++j){
-        gaine=lpf_gain;
-        for (int off = 1; off < pb*blockDim.x; off *= 2) {
-            __syncthreads();
-            for (int i = 0; i < pb; i++) {
-                idx=tx+i*blockDim.x;
-                if (idx >= off) {
-                    Zdest[idx] = Zsrc[idx]+gaine*Zsrc[idx - off];
-                }
-                else 
-                    Zdest[idx] = Zsrc[idx];
-            }
-            gaine*=gaine;
-            Ztemp=Zsrc;
-            Zsrc=Zdest;
-            Zdest=Ztemp;
+        float v = (idx < sampleSize) ? inputSample[idx] : 0.0f;
+        Zsrc[idx] = v;
+        if (idx + delay < sampleSize) {
+            outputSample[idx + delay] = v;
         }
-
-        __syncthreads();
-        
-        for (int i = 0; i < pb; ++i){
-            idx = i*blockDim.x + tx;
-            if (idx < delay){
-                Zsrc[idx] = gain*Zsrc[idx] + inputSample[(j-1)*delay+idx];
-                outputSample[j*delay+idx] = Zsrc[idx];
-            }
-        }
-        if (tx == 0)
-            Zsrc[0] +=outputSample[j*delay-1];
     }
 }
+
+// Folds the previous block's L-carry into this block's scan seed, before the
+// scan below runs. Single-thread: only Zsrc[0] is touched.
+__global__ void LPCombFoldCarry(float* __restrict__ Zsrc, const float* __restrict__ carry, float lpf_gain)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        Zsrc[0] += lpf_gain * (*carry);
+    }
+}
+
+// One doubling round of the Hillis-Steele scan for the block's L recursion.
+__global__ void LPCombScanRound(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    float gaine,
+    long off,
+    long delay)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < delay) {
+        dst[idx] = (idx >= off) ? (src[idx] + gaine * src[idx - off]) : src[idx];
+    }
+}
+
+// Saves this block's last scanned L value as the carry for the next block.
+// Launched before LPCombConvertToY below in the same stream, so this always
+// reads the scan result before ConvertToY starts overwriting it - no
+// explicit sync needed, same-stream launch order already guarantees it.
+__global__ void LPCombSaveCarry(const float* __restrict__ Zsrc, float* __restrict__ carry, long delay)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *carry = Zsrc[delay - 1];
+    }
+}
+
+// Converts this block's scanned L values into the next block's y (comb
+// output) values, and writes them to the output buffer.
+__global__ void LPCombConvertToY(
+    float* __restrict__ Zsrc,
+    const float* __restrict__ inputSample,
+    float* __restrict__ outputSample,
+    float gain,
+    long j,
+    long delay,
+    long sampleSize)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < delay) {
+        float v = gain * Zsrc[idx] + inputSample[(j - 1) * delay + idx];
+        Zsrc[idx] = v;
+        if (j * delay + idx < sampleSize) {
+            outputSample[j * delay + idx] = v;
+        }
+    }
+}
+
+// Runs the full LPComb filter on device buffers the caller already owns
+// (do_lp_filter_GPU and do_reverb_SoundSample_GPU each have their own buffer
+// lifetime/reuse strategy, so this just takes pointers rather than owning
+// any memory itself). Zsrc/Zdest must each be at least
+// ceil(delay/256)*256 floats; carryScratch is a single device float used as
+// scratch space across iterations, reset to 0 here at the start of every
+// call (it does not need to persist between calls).
+//
+// Math (from LPCombFilter.cpp + LowPassFilter.cpp):
+//   y[n] = x[n-D] + g*L[n-D]        (n >= D, else y[n] = 0)
+//   L[n] = y[n] + lpf_gain*L[n-1]   (L[-1] = 0)
+// Substituting y[n] shows L only depends on values one delay-block back
+// (via y[n-D]) and one step back (L[n-1]), so it's computed one delay-length
+// block at a time: given L for block (j-1), block j's y values are a plain
+// elementwise formula, and L for block j is a scan of those y values seeded
+// with L's last value from block (j-1).
+static void runLPCombFilterGPU(
+    const float* d_input,
+    float* d_output,
+    float* d_Zsrc,
+    float* d_Zdest,
+    float* d_carryScratch,
+    float gain,
+    long delay,
+    float lpf_gain,
+    long sampleSize)
+{
+    const int threadsPerBlock = 256;
+    const int delayBlocks = (int)((delay + threadsPerBlock - 1) / threadsPerBlock);
+    const long delayPadded = (long)delayBlocks * threadsPerBlock;
+
+    CUDA_CHECK(cudaMemsetAsync(d_carryScratch, 0, sizeof(float)));
+
+    LPCombSetup<<<delayBlocks, threadsPerBlock>>>(d_input, d_output, d_Zsrc, delay, sampleSize);
+
+    long ps = (sampleSize + delay - 1) / delay;
+    float* Zsrc = d_Zsrc;
+    float* Zdest = d_Zdest;
+
+    for (long j = 2; j < ps; ++j) {
+        LPCombFoldCarry<<<1, 1>>>(Zsrc, d_carryScratch, lpf_gain);
+
+        float gaine = lpf_gain;
+        for (long off = 1; off < delayPadded; off *= 2) {
+            LPCombScanRound<<<delayBlocks, threadsPerBlock>>>(Zsrc, Zdest, gaine, off, delay);
+            float* temp = Zsrc; Zsrc = Zdest; Zdest = temp;
+            gaine *= gaine;
+        }
+        // Zsrc now holds L for block j-1.
+
+        LPCombSaveCarry<<<1, 1>>>(Zsrc, d_carryScratch, delay);
+        LPCombConvertToY<<<delayBlocks, threadsPerBlock>>>(Zsrc, d_input, d_output, gain, j, delay, sampleSize);
+    }
+}
+
+namespace {
+    float* g_lpInputArena = nullptr;
+    float* g_lpOutputArena = nullptr;
+    long g_lpFloatArenaCapacity = 0; // shared capacity for input/output (both sampleSize)
+
+    float* g_lpZsrcArena = nullptr;
+    float* g_lpZdestArena = nullptr;
+    long g_lpDelayArenaCapacity = 0; // shared capacity for Zsrc/Zdest (both delayPadded)
+
+    float* g_lpCarryArena = nullptr; // single float, allocated once
+
+    void ensureLPArenas(long sampleSize, long delayPadded, float** outInput, float** outOutput, float** outZsrc, float** outZdest, float** outCarry)
+    {
+        if (sampleSize > g_lpFloatArenaCapacity) {
+            if (g_lpInputArena != nullptr) CUDA_CHECK(cudaFree(g_lpInputArena));
+            if (g_lpOutputArena != nullptr) CUDA_CHECK(cudaFree(g_lpOutputArena));
+            CUDA_CHECK(cudaMalloc(&g_lpInputArena, sampleSize * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&g_lpOutputArena, sampleSize * sizeof(float)));
+            g_lpFloatArenaCapacity = sampleSize;
+        }
+        if (delayPadded > g_lpDelayArenaCapacity) {
+            if (g_lpZsrcArena != nullptr) CUDA_CHECK(cudaFree(g_lpZsrcArena));
+            if (g_lpZdestArena != nullptr) CUDA_CHECK(cudaFree(g_lpZdestArena));
+            CUDA_CHECK(cudaMalloc(&g_lpZsrcArena, delayPadded * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&g_lpZdestArena, delayPadded * sizeof(float)));
+            g_lpDelayArenaCapacity = delayPadded;
+        }
+        if (g_lpCarryArena == nullptr) {
+            CUDA_CHECK(cudaMalloc(&g_lpCarryArena, sizeof(float)));
+        }
+        *outInput = g_lpInputArena;
+        *outOutput = g_lpOutputArena;
+        *outZsrc = g_lpZsrcArena;
+        *outZdest = g_lpZdestArena;
+        *outCarry = g_lpCarryArena;
+    }
+}
+
 SoundSample* do_lp_filter_GPU(SoundSample *inWave, float lpf_g, float g, long d){
-    
-    float* inWaveData = inWave->getData();
     long sampleSize = inWave->getSampleCount();
     SoundSample *outWave = new SoundSample(sampleSize, inWave->getSamplingRate());
-    float* outWaveData, *dbuff0,*dbuff1; 
-    float* inWaveDataD;
-    CUDA_CHECK(cudaMalloc(&inWaveDataD,sampleSize*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&outWaveData,sampleSize*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dbuff0, CEIL_MULT(d, 256)*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dbuff1, CEIL_MULT(d, 256)*sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(inWaveDataD, inWaveData, sampleSize * sizeof(float), cudaMemcpyHostToDevice));
-    LPCombFilterGPU<<<1,256>>>(inWaveDataD, outWaveData, g, d, lpf_g, dbuff0, dbuff1,sampleSize);
 
+    const int threadsPerBlock = 256;
+    const long delayPadded = (long)((d + threadsPerBlock - 1) / threadsPerBlock) * threadsPerBlock;
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    float *d_input, *d_output, *d_Zsrc, *d_Zdest, *d_carry;
+    ensureLPArenas(sampleSize, delayPadded, &d_input, &d_output, &d_Zsrc, &d_Zdest, &d_carry);
 
-    
-    CUDA_CHECK(cudaMemcpy(outWave->getData(), outWaveData, sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
-    return outWave;                    
+    CUDA_CHECK(cudaMemcpy(d_input, inWave->getData(), sampleSize * sizeof(float), cudaMemcpyHostToDevice));
 
+    runLPCombFilterGPU(d_input, d_output, d_Zsrc, d_Zdest, d_carry, g, d, lpf_g, sampleSize);
+
+    CUDA_CHECK(cudaMemcpy(outWave->getData(), d_output, sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+    return outWave;
 }
 
 __global__ void HexAllPassFilterGPU(float *inputSample, float *inputSample0, float *inputSample1, float *inputSample2, float *inputSample3, float *inputSample4, float *inputSample5, float* outputSample, float* envData, float inputGain, long inputDelay, float *delaybuf0, float *delaybuf1, long sampleSize){
@@ -330,100 +614,113 @@ __global__ void HexAllPassFilterGPU(float *inputSample, float *inputSample0, flo
         }
     }
 }
-__global__ void AllPassFilterGPU(
-    float *inputSample, 
-    float *buf0,  // Buffer for c coefficients (size: sampleSize)
-    float *buf1,  // Buffer for a powers (size: sampleSize)
-    float inputGain, 
+// The old AllPassFilterGPU did its whole doubling scan (stride = D, 2D, 4D,
+// ...) inside one <<<1,256>>> launch with an in-kernel __syncthreads()
+// between rounds - which only synchronizes within a single block, so it
+// silently capped the kernel at 256 threads total no matter how large
+// sampleSize was (256 threads is a small fraction of an RTX-class GPU).
+// Unlike LPCombFilterGPU, this scan runs across the *entire* sample buffer
+// in one pass (no per-delay-block decomposition), so each round is already
+// embarrassingly parallel across all of sampleSize - it just needs enough
+// blocks to cover it. Moving each round to its own kernel launch (one round
+// = one launch, host-driven loop below) lets it use
+// gridDim = ceil(sampleSize/256) blocks per round instead of being capped at
+// 256 threads, and turns the round count into O(log2(sampleSize/D)) kernel
+// launches - typically single digits to a few dozen, not the thousand-plus
+// sequential iterations LPCombFilterGPU's block-recurrent structure needs.
+
+// Initial elementwise setup: b0[idx] = b1[idx] = -g*x[idx] + c1*x[idx-D] (for
+// idx >= D). Both buffers start identical; the round loop below scans them.
+__global__ void AllPassFilterInit(
+    const float* __restrict__ inputSample,
+    float* __restrict__ b0,
+    float* __restrict__ b1,
+    float g,
     float c1,
-    float c2,
-    long inputDelay, 
-
-    long sampleSize
-    )   // Starting offset for this wave
+    long D,
+    long sampleSize)
 {
-    long idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float g = inputGain;
-    long D = inputDelay;
-    float* temp;
-    float *b0 = buf0;
-    float *b1 = buf1;
-    float m = c2;
-    long loop_count = (sampleSize + (blockDim.x * gridDim.x) - 1)/(blockDim.x * gridDim.x);
-    for(long i = 0; i < loop_count; i++){
-        if(i*blockDim.x * gridDim.x + idx < sampleSize){
-            b0[i*blockDim.x * gridDim.x + idx] = -g*inputSample[i*blockDim.x * gridDim.x + idx];
-            b1[i*blockDim.x * gridDim.x + idx] = -g*inputSample[i*blockDim.x * gridDim.x + idx];
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < sampleSize) {
+        float v = -g * inputSample[idx];
+        if (idx >= D) {
+            v += c1 * inputSample[idx - D];
         }
-        if(i*blockDim.x * gridDim.x + idx < sampleSize && i*blockDim.x * gridDim.x + idx >= D){
-            b0[i*blockDim.x * gridDim.x + idx ] += c1*inputSample[i*blockDim.x * gridDim.x + idx - D];
-            b1[i*blockDim.x * gridDim.x + idx] += c1*inputSample[i*blockDim.x * gridDim.x + idx - D];
-        } 
+        b0[idx] = v;
+        b1[idx] = v;
     }
-
- 
-     
-    
-    
-        /*
-            
-    long stride = D;    
-    for(long i = 0; i < loop_count; i++){
-        if(i*blockDim.x * gridDim.x + idx  >= stride && i*blockDim.x * gridDim.x + idx  < 2*stride){
-         b1[i*blockDim.x * gridDim.x + idx ] += m * b0[i*blockDim.x * gridDim.x + idx  - stride];
-        }
-        else{
-            b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx ];
-        }
-        
-    }
-    temp = b0;
-        b0 = b1;
-        b1 = temp;
-        m = m*m;
-        
-        
-        */
-            
-    for(long stride = D; stride < (sampleSize+1)/2; stride = stride*2){
-         __syncthreads();
-        for(long i = 0; i < loop_count; i++){
-            if(i*blockDim.x * gridDim.x + idx  >= stride && i*blockDim.x * gridDim.x + idx  < sampleSize){
-             b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx] + m * b0[i*blockDim.x * gridDim.x + idx  - stride];
-            }
-            else{
-                b1[i*blockDim.x * gridDim.x + idx ] = b0[i*blockDim.x * gridDim.x + idx ];
-            }
-            
-        }
-        temp = b0;
-            b0 = b1;
-            b1 = temp;
-            m = m*m;
-       
-    }
-
-    
 }
- 
+
+// One doubling round of the D-strided Hillis-Steele-style scan.
+__global__ void AllPassFilterRound(
+    const float* __restrict__ b0,
+    float* __restrict__ b1,
+    float m,
+    long stride,
+    long sampleSize)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < sampleSize) {
+        b1[idx] = (idx >= stride) ? (b0[idx] + m * b0[idx - stride]) : b0[idx];
+    }
+}
+
+namespace {
+    float* g_apInputArena = nullptr;
+    float* g_apB0Arena = nullptr;
+    float* g_apB1Arena = nullptr;
+    long g_apArenaCapacity = 0;
+
+    void ensureAPArenas(long sampleSize, float** outInput, float** outB0, float** outB1)
+    {
+        if (sampleSize > g_apArenaCapacity) {
+            if (g_apInputArena != nullptr) CUDA_CHECK(cudaFree(g_apInputArena));
+            if (g_apB0Arena != nullptr) CUDA_CHECK(cudaFree(g_apB0Arena));
+            if (g_apB1Arena != nullptr) CUDA_CHECK(cudaFree(g_apB1Arena));
+            CUDA_CHECK(cudaMalloc(&g_apInputArena, sampleSize * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&g_apB0Arena, sampleSize * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&g_apB1Arena, sampleSize * sizeof(float)));
+            g_apArenaCapacity = sampleSize;
+        }
+        *outInput = g_apInputArena;
+        *outB0 = g_apB0Arena;
+        *outB1 = g_apB1Arena;
+    }
+}
+
 SoundSample* do_ap_filter_GPU(SoundSample *inWave, float g, long d){
 
-     long sampleSize = inWave->getSampleCount();
+    long sampleSize = inWave->getSampleCount();
     float* inWaveData = inWave->getData();
-    SoundSample *outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-    float* outWaveData, *dbuff0; 
-    float* inWaveDataD;
-    CUDA_CHECK(cudaMalloc(&inWaveDataD,sampleSize*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&outWaveData,sampleSize*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dbuff0, CEIL_MULT(d, 256)*sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(inWaveDataD, inWaveData, sampleSize * sizeof(float), cudaMemcpyHostToDevice));
-    AllPassFilterGPU<<<1,256>>>(inWaveDataD,  dbuff0,outWaveData,g, 1-g*g, (1-(g*g))*g, d, sampleSize);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(outWave->getData(), outWaveData,
-                          sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
-     
-    return outWave;                    
+    SoundSample *outWave = new SoundSample(sampleSize, inWave->getSamplingRate());
 
+    const int threadsPerBlock = 256;
+    const int blocks = (int)((sampleSize + threadsPerBlock - 1) / threadsPerBlock);
+
+    float *d_input, *d_b0, *d_b1;
+    ensureAPArenas(sampleSize, &d_input, &d_b0, &d_b1);
+
+    CUDA_CHECK(cudaMemcpy(d_input, inWaveData, sampleSize * sizeof(float), cudaMemcpyHostToDevice));
+
+    float c1 = 1 - g*g;
+    AllPassFilterInit<<<blocks, threadsPerBlock>>>(d_input, d_b0, d_b1, g, c1, d, sampleSize);
+
+    // Host tracks which buffer is current, so - unlike the old kernel's
+    // ping-pong - there's no ambiguity about where the final result ends up
+    // regardless of how many rounds run.
+    float* cur = d_b0;
+    float* next = d_b1;
+    float m = c1 * g; // c2
+    for (long stride = d; stride < (sampleSize+1)/2; stride *= 2) {
+        AllPassFilterRound<<<blocks, threadsPerBlock>>>(cur, next, m, stride, sampleSize);
+        float* temp = cur; cur = next; next = temp;
+        m = m*m;
+    }
+
+    CUDA_CHECK(cudaMemcpy(outWave->getData(), cur,
+                          sampleSize * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return outWave;
 }
 
 
@@ -581,12 +878,19 @@ SoundSample* do_reverb_SoundSample_GPU(SoundSample *inWave, Envelope *percentRev
     cudaMalloc(&outWaveDataD, sampleSize*sizeof(float));
     cudaMalloc(&envDataD, sampleSize*sizeof(float));
     cudaMemcpy(inWaveDataD, inWaveData, sampleSize*sizeof(float), cudaMemcpyHostToDevice);
-    LPCombFilterGPU<<<1, 256>>>(inWaveDataD, outWaveDataD0, lpCombFilter[0]->get_g(), lpCombFilter[0]->get_D(), lpCombFilter[0]->get_lpf_g(), delay0bufD0, delay1bufD0, sampleSize);
-    LPCombFilterGPU<<<1, 256>>>(inWaveDataD, outWaveDataD1, lpCombFilter[1]->get_g(), lpCombFilter[1]->get_D(), lpCombFilter[1]->get_lpf_g(), delay0bufD1, delay1bufD1, sampleSize);
-    LPCombFilterGPU<<<1, 256>>>(inWaveDataD, outWaveDataD2, lpCombFilter[2]->get_g(), lpCombFilter[2]->get_D(), lpCombFilter[2]->get_lpf_g(), delay0bufD2, delay1bufD2, sampleSize);
-    LPCombFilterGPU<<<1, 256>>>(inWaveDataD, outWaveDataD3, lpCombFilter[3]->get_g(), lpCombFilter[3]->get_D(), lpCombFilter[3]->get_lpf_g(), delay0bufD3, delay1bufD3, sampleSize);
-    LPCombFilterGPU<<<1, 256>>>(inWaveDataD, outWaveDataD4, lpCombFilter[4]->get_g(), lpCombFilter[4]->get_D(), lpCombFilter[4]->get_lpf_g(), delay0bufD4, delay1bufD4, sampleSize);
-    LPCombFilterGPU<<<1, 256>>>(inWaveDataD, outWaveDataD5, lpCombFilter[5]->get_g(), lpCombFilter[5]->get_D(), lpCombFilter[5]->get_lpf_g(), delay0bufD5, delay1bufD5, sampleSize);
+    // Single small carry scratch buffer shared across all 6 comb filters -
+    // safe because runLPCombFilterGPU resets it at the start of every call,
+    // and these 6 calls are issued to the same (default) stream, so each
+    // one's kernels fully complete before the next one's begin.
+    float* lpCarryScratch;
+    cudaMalloc(&lpCarryScratch, sizeof(float));
+    runLPCombFilterGPU(inWaveDataD, outWaveDataD0, delay0bufD0, delay1bufD0, lpCarryScratch, lpCombFilter[0]->get_g(), lpCombFilter[0]->get_D(), lpCombFilter[0]->get_lpf_g(), sampleSize);
+    runLPCombFilterGPU(inWaveDataD, outWaveDataD1, delay0bufD1, delay1bufD1, lpCarryScratch, lpCombFilter[1]->get_g(), lpCombFilter[1]->get_D(), lpCombFilter[1]->get_lpf_g(), sampleSize);
+    runLPCombFilterGPU(inWaveDataD, outWaveDataD2, delay0bufD2, delay1bufD2, lpCarryScratch, lpCombFilter[2]->get_g(), lpCombFilter[2]->get_D(), lpCombFilter[2]->get_lpf_g(), sampleSize);
+    runLPCombFilterGPU(inWaveDataD, outWaveDataD3, delay0bufD3, delay1bufD3, lpCarryScratch, lpCombFilter[3]->get_g(), lpCombFilter[3]->get_D(), lpCombFilter[3]->get_lpf_g(), sampleSize);
+    runLPCombFilterGPU(inWaveDataD, outWaveDataD4, delay0bufD4, delay1bufD4, lpCarryScratch, lpCombFilter[4]->get_g(), lpCombFilter[4]->get_D(), lpCombFilter[4]->get_lpf_g(), sampleSize);
+    runLPCombFilterGPU(inWaveDataD, outWaveDataD5, delay0bufD5, delay1bufD5, lpCarryScratch, lpCombFilter[5]->get_g(), lpCombFilter[5]->get_D(), lpCombFilter[5]->get_lpf_g(), sampleSize);
+    cudaFree(lpCarryScratch);
     cudaDeviceSynchronize();
 
     cudaMalloc(&envXYD, segSize*2*sizeof(float));

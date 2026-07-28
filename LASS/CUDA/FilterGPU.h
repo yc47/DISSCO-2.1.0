@@ -3,13 +3,35 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include "../../LASS/src/LASS.h"
-__global__ void LPCombFilterGPU(float *inputSample, float* outputSample, float inputGain, long inputDelay, float inputLpf_gain, float *delaybuf0, float *delaybuf1, long sampleSize);
+__global__ void LPCombSetup(
+    const float* __restrict__ inputSample,
+    float* __restrict__ outputSample,
+    float* __restrict__ Zsrc,
+    long delay,
+    long sampleSize);
+__global__ void LPCombFoldCarry(float* __restrict__ Zsrc, const float* __restrict__ carry, float lpf_gain);
+__global__ void LPCombScanRound(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    float gaine,
+    long off,
+    long delay);
+__global__ void LPCombSaveCarry(const float* __restrict__ Zsrc, float* __restrict__ carry, long delay);
+__global__ void LPCombConvertToY(
+    float* __restrict__ Zsrc,
+    const float* __restrict__ inputSample,
+    float* __restrict__ outputSample,
+    float gain,
+    long j,
+    long delay,
+    long sampleSize);
 __global__ void HexAllPassFilterGPU(float *inputSample, float *inputSample0, float *inputSample1, float *inputSample2, float *inputSample3, float *inputSample4, float *inputSample5, float* outputSample, float* envData, float inputGain, long inputDelay, float *delaybuf0, float *delaybuf1, long sampleSize);
 __global__ void getEnvData(float *xyPoints, int *segmentTypes, float *envData, int segmentSize, long sampleSize);
 SoundSample* do_reverb_SoundSample_GPU(SoundSample *inWave, Envelope *percentReverbinput, LPCombFilter **lpCombFilter, AllPassFilter *allPassFilter);
 struct __align__(16) AR2Node {
     float a00, a01, a10, a11;
     float b0, b1;
+    float _pad0, _pad1; // pads struct to 32B so every array element is 16B-aligned, letting nvcc emit vectorized 128-bit loads/stores
 };
 SoundSample* do_biquad_filter_GPU(
     SoundSample *inWave, 
@@ -24,6 +46,10 @@ __global__ void AddPrefixAndExtract(
     const AR2Node* __restrict__ block_prefixes,
     float* __restrict__ output,
     long N);
+__global__ void AddBlockPrefixInPlace(
+    AR2Node* __restrict__ nodes,
+    const AR2Node* __restrict__ block_prefixes,
+    long N);
 __global__ void BiQuadFilterFused_Scan(
     const float* __restrict__ inputSample,
     AR2Node* __restrict__ outputNodes,
@@ -36,14 +62,18 @@ __global__ void BiQuadFilterFused_Scan(
         AR2Node* __restrict__ block_results,
         long N);
 SoundSample* do_lp_filter_GPU(SoundSample *inWave, float lpf_g, float g, long d);
-__global__ void AllPassFilterGPU(
-    float *inputSample, 
-    float *buf0,  // Buffer for c coefficients (size: sampleSize)
-    float *buf1,  // Buffer for a powers (size: sampleSize)
-    float inputGain, 
+__global__ void AllPassFilterInit(
+    const float* __restrict__ inputSample,
+    float* __restrict__ b0,
+    float* __restrict__ b1,
+    float g,
     float c1,
-    float c2,
-    long inputDelay, 
-    long sampleSize
-    ) ;
+    long D,
+    long sampleSize);
+__global__ void AllPassFilterRound(
+    const float* __restrict__ b0,
+    float* __restrict__ b1,
+    float m,
+    long stride,
+    long sampleSize);
 SoundSample* do_ap_filter_GPU(SoundSample *inWave, float g, long d);

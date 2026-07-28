@@ -20,6 +20,7 @@
 
 //----------------------------------------------------------------------------//
 #include <cstdlib>
+#include <cmath>
 #include "SoundSample.h"
 #include "Collection.h"
 #include "Track.h"
@@ -279,14 +280,14 @@ m_sample_type Reverb::do_reverb(m_sample_type x_t, float x_value, Envelope *perc
   // run the sample through various comb filters (for effeciency
   // reasons, I hard coded this (instead of looping from 0 to
   // (REVERB_NUM_COMB_FILTERS-1).
-  int cases = 1;
+  int cases = 0;
   switch(cases){
     case 0:
     y  = bq->do_filter(x_t);
     break;
 
     case 1:
-    //y = lpcfilter[0]->do_filter(x_t);
+    y = lpcfilter[0]->do_filter(x_t);
     y = apfilter->do_filter(x_t);
     break;
   }
@@ -406,7 +407,7 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave)
   return do_reverb_SoundSample(inWave, percentReverb);
 }
 SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percentReverbinput)
-{
+{/*
   int hash = rand()%12567;
   int i;
   SoundSample *outWave;  
@@ -457,69 +458,165 @@ SoundSample *Reverb::do_reverb_SoundSample(SoundSample *inWave, Envelope *percen
     cout<< "d" << D<<endl;
     delete(outputSample);
  
-    delete(bro);
+    delete(bro);*/
 // Measure GPU time
-/*
+
+int hash = rand()%12567;
+long sampleCount = inWave->getSampleCount();
+printf("%d samples: %ld rate: %u\n", hash,
+    sampleCount, inWave->getSamplingRate());
 auto gpu_start = std::chrono::high_resolution_clock::now();
-outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-outWave = bq->do_filter_SoundSample(inWave);  // GPU method
-cudaDeviceSynchronize();  // ⭐ CRITICAL: Wait for GPU to finish!
+
+SoundSample *gpuWave = bq->do_filter_SoundSample(inWave);  // GPU method
 auto gpu_end = std::chrono::high_resolution_clock::now();
 printf("%d gpu: %.3f ms\n", hash,
     std::chrono::duration<double, std::milli>(gpu_end - gpu_start).count());
 
 // Measure CPU time separately
 auto cpu_start = std::chrono::high_resolution_clock::now();
-outWave = new SoundSample(inWave->getSampleCount(), inWave->getSamplingRate());
-for(i=0; i<inWave->getSampleCount(); i++){
-    (*outWave)[i] = do_reverb((*inWave)[i], 
-                              (float)i / inWave->getSampleCount(), 
-                              percentReverb);
+SoundSample *cpuWave = new SoundSample(sampleCount, inWave->getSamplingRate());
+float y;
+for(int i=0; i<sampleCount; i++){
+
+    y  = bq->do_filter((*inWave)[i]);
+
+    (*cpuWave)[i] = y;
 }
 auto cpu_end = std::chrono::high_resolution_clock::now();
 printf("%d cpu: %.3f ms\n", hash,
     std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());
-    outWave = lpcfilter[0]->do_filter_SoundSample(inWave);
-    outWave = apfilter->do_filter_SoundSample(outWave);
-    cout << "outwave 0 " << (*outWave)[0] << endl;
-    cout << "outwave 1000 " << (*outWave)[1000] << endl;
-    cout << "outwave 10000 " << (*outWave)[10000] << endl;
-    cout << "outwave 100000 " << (*outWave)[100000] << endl;
-    SoundSample* outWaved = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());
 
-    for(i=0;i<inWave->getSampleCount();i++)
-      (*outWaved)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
-			      , percentReverb);*/
-    
-    /*
-    std::vector<float> y(inWave->getSampleCount(), 0.0);
-
-    for (size_t n = 0; n < inWave->getSampleCount(); ++n) {
-        float x0 = (*inWave)[n];
-        float x1 = (n >= 1) ? (*inWave)[n - 1] : 0.0;
-        float x2 = (n >= 2) ? (*inWave)[n - 2] : 0.0;
-        float y1 = (n >= 1) ? y[n - 1] : 0.0;
-        float y2 = (n >= 2) ? y[n - 2] : 0.0;
-
-        y[n] = bq->ba0 * x0 + bq->ba1 * x1 + bq->ba2 * x2 - bq->ba1 * y1 - bq->ba2 * y2;
+// Correctness check: the GPU parallel scan and the CPU sequential recurrence
+// implement the same math but sum terms in a different order, so exact
+// bit-for-bit equality isn't expected - a small tolerance accounts for
+// floating-point rounding. This is what actually exercises the multi-level
+// scan fix for buffers over 65536 samples: a regression there shows up as a
+// large divergence starting around that sample index, not as noise spread
+// evenly across the buffer.
+const float tolerance = 1e-3f;
+long mismatchCount = 0;
+long firstBadIndex = -1;
+float maxDiff = 0.0f;
+long maxDiffIndex = -1;
+for (long i = 0; i < sampleCount; i++) {
+    float diff = std::fabs((*gpuWave)[i] - (*cpuWave)[i]);
+    if (diff > maxDiff) {
+        maxDiff = diff;
+        maxDiffIndex = i;
     }
-    cout << y[0] << endl;
-    cout << y[1000] << endl;
-    cout << y[10000] << endl;
-    cout << y[100000] << endl;*/
-  #else
-    // create new SoundSample
-    outWave = new SoundSample(inWave->getSampleCount(),
-	  		    inWave->getSamplingRate());
+    if (diff > tolerance) {
+        mismatchCount++;
+        if (firstBadIndex < 0) firstBadIndex = i;
+    }
+}
+if (mismatchCount == 0) {
+    printf("%d correctness: PASS (max diff %.6f at sample %ld)\n",
+        hash, maxDiff, maxDiffIndex);
+} else {
+    printf("%d correctness: FAIL - %ld/%ld samples exceed tolerance %.6f, "
+           "first at sample %ld, max diff %.6f at sample %ld\n",
+        hash, mismatchCount, sampleCount, tolerance,
+        firstBadIndex, maxDiff, maxDiffIndex);
+}
 
-    for(i=0;i<inWave->getSampleCount();i++)
-      (*outWave)[i] = do_reverb((*inWave)[i],(float) i / inWave->getSampleCount()
-			      , percentReverb);
-            
-  #endif
+delete gpuWave;
 
-  return outWave;
+// Same timing/correctness comparison, this time for the first LP-comb
+// filter (LPCombFilterGPU, a different kernel from the biquad path above -
+// it runs a Hillis-Steele parallel scan of the comb's internal lowpass
+// filter with a cross-block carry term whose correctness wasn't provable by
+// inspection alone, see review notes).
+auto lp_gpu_start = std::chrono::high_resolution_clock::now();
+SoundSample *lpGpuWave = lpcfilter[0]->do_filter_SoundSample(inWave);  // GPU method
+auto lp_gpu_end = std::chrono::high_resolution_clock::now();
+printf("%d lp_gpu: %.3f ms\n", hash,
+    std::chrono::duration<double, std::milli>(lp_gpu_end - lp_gpu_start).count());
+
+auto lp_cpu_start = std::chrono::high_resolution_clock::now();
+SoundSample *lpCpuWave = new SoundSample(sampleCount, inWave->getSamplingRate());
+for (long i = 0; i < sampleCount; i++) {
+    (*lpCpuWave)[i] = lpcfilter[0]->do_filter((*inWave)[i]);
+}
+auto lp_cpu_end = std::chrono::high_resolution_clock::now();
+printf("%d lp_cpu: %.3f ms\n", hash,
+    std::chrono::duration<double, std::milli>(lp_cpu_end - lp_cpu_start).count());
+
+long lpMismatchCount = 0;
+long lpFirstBadIndex = -1;
+float lpMaxDiff = 0.0f;
+long lpMaxDiffIndex = -1;
+for (long i = 0; i < sampleCount; i++) {
+    float diff = std::fabs((*lpGpuWave)[i] - (*lpCpuWave)[i]);
+    if (diff > lpMaxDiff) {
+        lpMaxDiff = diff;
+        lpMaxDiffIndex = i;
+    }
+    if (diff > tolerance) {
+        lpMismatchCount++;
+        if (lpFirstBadIndex < 0) lpFirstBadIndex = i;
+    }
+}
+if (lpMismatchCount == 0) {
+    printf("%d lp_correctness: PASS (max diff %.6f at sample %ld)\n",
+        hash, lpMaxDiff, lpMaxDiffIndex);
+} else {
+    printf("%d lp_correctness: FAIL - %ld/%ld samples exceed tolerance %.6f, "
+           "first at sample %ld, max diff %.6f at sample %ld\n",
+        hash, lpMismatchCount, sampleCount, tolerance,
+        lpFirstBadIndex, lpMaxDiff, lpMaxDiffIndex);
+}
+delete lpGpuWave;
+delete lpCpuWave;
+
+// Small timing/correctness check for the standalone AllPassFilterGPU path
+// (AllPassFilterGPU/do_ap_filter_GPU), which had its own separate bugs - a
+// buf0 allocation sized to the delay instead of sampleSize (heap overflow),
+// and a ping-pong buffer whose final result landed in either buf0 or buf1
+// depending on iteration parity while the host always read back buf1. Both
+// are fixed now; this exercises that fix the same way the checks above do.
+auto ap_gpu_start = std::chrono::high_resolution_clock::now();
+SoundSample *apGpuWave = apfilter->do_filter_SoundSample(inWave);  // GPU method
+auto ap_gpu_end = std::chrono::high_resolution_clock::now();
+printf("%d ap_gpu: %.3f ms\n", hash,
+    std::chrono::duration<double, std::milli>(ap_gpu_end - ap_gpu_start).count());
+
+auto ap_cpu_start = std::chrono::high_resolution_clock::now();
+SoundSample *apCpuWave = new SoundSample(sampleCount, inWave->getSamplingRate());
+for (long i = 0; i < sampleCount; i++) {
+    (*apCpuWave)[i] = apfilter->do_filter((*inWave)[i]);
+}
+auto ap_cpu_end = std::chrono::high_resolution_clock::now();
+printf("%d ap_cpu: %.3f ms\n", hash,
+    std::chrono::duration<double, std::milli>(ap_cpu_end - ap_cpu_start).count());
+
+long apMismatchCount = 0;
+long apFirstBadIndex = -1;
+float apMaxDiff = 0.0f;
+long apMaxDiffIndex = -1;
+for (long i = 0; i < sampleCount; i++) {
+    float diff = std::fabs((*apGpuWave)[i] - (*apCpuWave)[i]);
+    if (diff > apMaxDiff) {
+        apMaxDiff = diff;
+        apMaxDiffIndex = i;
+    }
+    if (diff > tolerance) {
+        apMismatchCount++;
+        if (apFirstBadIndex < 0) apFirstBadIndex = i;
+    }
+}
+if (apMismatchCount == 0) {
+    printf("%d ap_correctness: PASS (max diff %.6f at sample %ld)\n",
+        hash, apMaxDiff, apMaxDiffIndex);
+} else {
+    printf("%d ap_correctness: FAIL - %ld/%ld samples exceed tolerance %.6f, "
+           "first at sample %ld, max diff %.6f at sample %ld\n",
+        hash, apMismatchCount, sampleCount, tolerance,
+        apFirstBadIndex, apMaxDiff, apMaxDiffIndex);
+}
+delete apGpuWave;
+delete apCpuWave;
+
+return cpuWave;
 }
 
 /**
